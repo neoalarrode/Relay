@@ -1,6 +1,6 @@
 name: "Movistar IPTV Relay"
 description: "Relay multicast-to-HTTP para Movistar IPTV. Convierte streams multicast RTP/UDP a HTTP para acceso remoto via VPN."
-version: "1.0.0"
+version: "1.0.1"
 slug: "movistar_iptv_relay"
 url: "https://github.com/movistar-iptv-scanner"
 arch:
