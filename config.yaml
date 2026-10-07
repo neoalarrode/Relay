@@ -1,0 +1,30 @@
+name: "Movistar IPTV Relay"
+description: "Relay multicast-to-HTTP para Movistar IPTV. Convierte streams multicast RTP/UDP a HTTP para acceso remoto via VPN."
+version: "1.0.0"
+slug: "movistar_iptv_relay"
+url: "https://github.com/movistar-iptv-scanner"
+arch:
+  - amd64
+  - aarch64
+  - armv7
+  - i386
+host_network: true
+ports:
+  4022/tcp: 4022
+ports_description:
+  4022/tcp: "Puerto HTTP del relay"
+options:
+  port: 4022
+  mcast_interface: "auto"
+  max_clients: 10
+  buffer_kb: 1024
+schema:
+  port: "port"
+  mcast_interface: "str"
+  max_clients: "int(1,50)"
+  buffer_kb: "int(256,8192)"
+startup: "services"
+boot: "auto"
+map:
+  - config:rw
+panel_icon: "mdi:television-classic"
