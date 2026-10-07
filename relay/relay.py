@@ -4,12 +4,13 @@ Movistar IPTV Multicast-to-HTTP Relay
 Home Assistant Add-on
 
 Converts multicast RTP/UDP IPTV streams to plain HTTP MPEG-TS.
-Compatible with the scanner's --udpxy option.
+On startup discovers all channels from the Movistar DVB network
+and serves the metadata so remote scanners need only this URL.
 
 Endpoints:
   GET /udp/<addr>:<port>/   Stream multicast channel as HTTP
+  GET /channels             Channel list (JSON) - auto-discovered
   GET /status               Relay status (JSON)
-  GET /rtp/<addr>:<port>/   Same as /udp/ (alias)
 """
 
 import argparse
@@ -20,14 +21,27 @@ import struct
 import sys
 import threading
 import time
+import urllib.request
+from html import unescape
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from xml.etree.ElementTree import fromstring
 
 TS_SYNC = 0x47
 TS_SIZE = 188
+IPTV_DNS = "172.26.23.3"
+UA = "libcurl-agent/1.0 [IAL] WidgetManager Safari/538.1 CAP:803fd12a 1"
 
+END_POINTS = (
+    "http://portalnc.imagenio.telefonica.net:2001",
+    "http://asiptvnc.imagenio.telefonica.net:2070",
+    "http://reg360.imagenio.telefonica.net:2070",
+)
+
+
+# ── Network detection ────────────────────────────────────────────────────────
 
 def detect_iptv_ip():
-    for dns in ("172.26.23.3", "172.23.3.3"):
+    for dns in (IPTV_DNS, "172.23.3.3"):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.settimeout(2)
@@ -35,7 +49,6 @@ def detect_iptv_ip():
                 return s.getsockname()[0]
         except OSError:
             continue
-
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             ip = info[4][0]
@@ -43,34 +56,254 @@ def detect_iptv_ip():
                 return ip
     except OSError:
         pass
-
     return None
 
+
+# ── RTP stripping ────────────────────────────────────────────────────────────
 
 def strip_rtp(data):
     if len(data) < 12 or data[0] == TS_SYNC:
         return data
     if (data[0] >> 6) != 2:
         return data
-
     cc = data[0] & 0x0F
     has_padding = bool(data[0] & 0x20)
     has_extension = bool(data[0] & 0x10)
-
     offset = 12 + cc * 4
-
     if has_extension and len(data) > offset + 4:
         ext_len = (data[offset + 2] << 8) | data[offset + 3]
         offset += 4 + ext_len * 4
-
     end = len(data)
     if has_padding and end > offset:
         pad_count = data[-1]
         if pad_count < (end - offset):
             end -= pad_count
-
     return data[offset:end]
 
+
+# ── Movistar DVB metadata discovery ──────────────────────────────────────────
+
+def http_get(url, timeout=10):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    return resp.read().decode("utf-8")
+
+
+def api_call(endpoint, action):
+    try:
+        data = http_get(f"{endpoint}?action={action}")
+        return json.loads(unescape(data)).get("resultData")
+    except Exception as e:
+        print(f"[discovery] API {action} failed: {e}", flush=True)
+        return None
+
+
+def find_endpoint():
+    for ep in END_POINTS:
+        try:
+            http_get(ep + "/appserver/mvtv.do?action=getClientProfile", timeout=5)
+            return ep + "/appserver/mvtv.do"
+        except Exception:
+            continue
+    return None
+
+
+def multicast_join(addr, port, iptv_ip, timeout=5):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
+    sock.settimeout(timeout)
+    try:
+        sock.bind((addr, port))
+    except OSError:
+        sock.bind(("", port))
+    mreq = struct.pack("4s4s", socket.inet_aton(addr), socket.inet_aton(iptv_ip))
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    return sock, mreq
+
+
+def parse_dvb_chunk(data):
+    return {
+        "end": struct.unpack("B", data[:1])[0],
+        "filetype": struct.unpack("B", data[4:5])[0],
+        "fileid": struct.unpack(">H", data[5:7])[0] & 0x0FFF,
+        "data": data[12:].decode("latin1"),
+    }
+
+
+def download_dvb_xml(addr, port, iptv_ip, timeout=60):
+    files = {}
+    sock, mreq = multicast_join(addr, port, iptv_ip, timeout=5)
+    deadline = time.time() + timeout
+    last_file = None
+    try:
+        while time.time() < deadline:
+            try:
+                chunk = parse_dvb_chunk(sock.recv(65535))
+                if chunk["end"]:
+                    last_file = f"{chunk['filetype']}_{chunk['fileid']}"
+                    break
+            except (socket.timeout, struct.error):
+                continue
+        if not last_file:
+            return files
+        while time.time() < deadline:
+            xmldata = ""
+            chunk = {"end": False}
+            try:
+                while not chunk["end"]:
+                    chunk = parse_dvb_chunk(sock.recv(65535))
+                    xmldata += chunk["data"]
+                key = f"{chunk['filetype']}_{chunk['fileid']}"
+                files[key] = xmldata[:-4]
+                if key == last_file:
+                    break
+            except (socket.timeout, struct.error):
+                continue
+    finally:
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
+        except OSError:
+            pass
+        sock.close()
+    return files
+
+
+def parse_channels_xml(xml_str):
+    channels = {}
+    ns = "urn:dvb:ipisdns:2006"
+    try:
+        root = fromstring(xml_str.replace("\n", " "))
+        for svc in root[0][0].iter(f"{{{ns}}}SingleService"):
+            try:
+                ti = svc.find(f".//{{{ns}}}TextualIdentifier")
+                ip = svc.find(f".//{{{ns}}}IPMulticastAddress")
+                si = svc.find(f".//{{{ns}}}ServiceInfo")
+                if ti is None or ip is None:
+                    continue
+                ch_id = int(ti.attrib.get("ServiceName", "0"))
+                if ch_id == 0:
+                    continue
+                name_el = si.find(f"{{{ns}}}Name") if si is not None else None
+                name = ""
+                if name_el is not None and name_el.text:
+                    try:
+                        name = name_el.text.encode("latin1").decode("utf8").strip(" .*")
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        name = name_el.text.strip(" .*")
+                genre_parent = si.find(f"{{{ns}}}Genre") if si is not None else None
+                genre_el = genre_parent.find(f"{{{ns}}}Name") if genre_parent is not None else None
+                genre = ""
+                if genre_el is not None and genre_el.text:
+                    try:
+                        genre = genre_el.text.encode("latin1").decode("utf8")
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        genre = genre_el.text
+                channels[ch_id] = {
+                    "id": ch_id,
+                    "address": ip.attrib["Address"],
+                    "port": int(ip.attrib["Port"]),
+                    "name": name or f"Channel {ch_id}",
+                    "genre": genre,
+                }
+                repl = si.find(f"{{{ns}}}ReplacementService") if si is not None else None
+                if repl is not None:
+                    repl_ti = repl.find(f"{{{ns}}}TextualIdentifier")
+                    if repl_ti is not None:
+                        channels[ch_id]["replacement"] = int(
+                            repl_ti.attrib.get("ServiceName", "0"))
+            except (KeyError, ValueError, AttributeError):
+                continue
+    except Exception as e:
+        print(f"[discovery] Channel XML parse error: {e}", flush=True)
+    return channels
+
+
+def parse_packages_xml(xml_str):
+    packages = {}
+    ns = "urn:dvb:ipisdns:2006"
+    try:
+        root = fromstring(xml_str.replace("\n", " "))
+        for pkg in root[0].iter(f"{{{ns}}}Package"):
+            pname_el = pkg.find(f"{{{ns}}}PackageName")
+            pname = pname_el.text if pname_el is not None else "Unknown"
+            services = {}
+            for svc in pkg:
+                if svc.tag == f"{{{ns}}}PackageName":
+                    continue
+                ti = svc.find(f"{{{ns}}}TextualIdentifier")
+                ln = svc.find(f"{{{ns}}}LogicalChannelNumber")
+                if ti is not None and ln is not None:
+                    services[ti.attrib.get("ServiceName", "0")] = ln.text
+            if services:
+                packages[pname] = {"services": services}
+    except Exception as e:
+        print(f"[discovery] Package XML parse error: {e}", flush=True)
+    return packages
+
+
+def discover_channels(iptv_ip):
+    print("[discovery] Discovering Movistar network...", flush=True)
+
+    endpoint = find_endpoint()
+    if not endpoint:
+        print("[discovery] Cannot reach Movistar API", flush=True)
+        return {}
+
+    print(f"[discovery] API: {endpoint}", flush=True)
+
+    client = api_call(endpoint, "getClientProfile")
+    platform = api_call(endpoint, "getPlatformProfile")
+    if not client or not platform:
+        print("[discovery] Failed to get profiles", flush=True)
+        return {}
+
+    dem = client.get("demarcation", 0)
+    pkgs = client.get("tvPackages", "")
+    print(f"[discovery] Demarcation: {dem} | Packages: {pkgs}", flush=True)
+
+    dvb_ep = platform.get("dvbConfig", {}).get("dvbipiEntryPoint", "")
+    if ":" not in dvb_ep:
+        print("[discovery] No DVB entry point", flush=True)
+        return {}
+
+    grp, port = dvb_ep.split(":")
+    print(f"[discovery] DVB entry: {grp}:{port}", flush=True)
+
+    dem_xml = download_dvb_xml(grp, int(port), iptv_ip, timeout=30)
+    if "1_0" not in dem_xml:
+        print("[discovery] Failed DVB demarcation download", flush=True)
+        return {}
+
+    result = re.findall(
+        f"DEM_{dem}" + r'\..*?Address="(.*?)".*?\s*Port="(.*?)".*?',
+        dem_xml["1_0"], re.DOTALL)
+    if not result:
+        print(f"[discovery] Demarcation {dem} not found in DVB data", flush=True)
+        return {}
+
+    sp_grp, sp_port = result[0]
+    print(f"[discovery] Service provider: {sp_grp}:{sp_port}", flush=True)
+
+    sp_xml = download_dvb_xml(sp_grp, int(sp_port), iptv_ip, timeout=60)
+    channels = parse_channels_xml(sp_xml.get("2_0", ""))
+    packages = parse_packages_xml(sp_xml.get("5_0", ""))
+
+    services = {}
+    for pkg_name in pkgs.split("|") if pkgs != "ALL" else packages:
+        services.update(packages.get(pkg_name, {}).get("services", {}))
+    for ch_id in channels:
+        if str(ch_id) in services:
+            channels[ch_id]["dial"] = services[str(ch_id)]
+
+    print(f"[discovery] Found {len(channels)} channels", flush=True)
+    return channels
+
+
+# ── State ────────────────────────────────────────────────────────────────────
 
 class RelayState:
     def __init__(self):
@@ -79,6 +312,17 @@ class RelayState:
         self.total_served = 0
         self.start_time = time.time()
         self.bytes_relayed = 0
+        self.channels = {}
+        self.channels_time = None
+
+    def set_channels(self, channels):
+        with self.lock:
+            self.channels = channels
+            self.channels_time = time.time()
+
+    def get_channels(self):
+        with self.lock:
+            return dict(self.channels)
 
     def connect(self, key, client):
         with self.lock:
@@ -108,14 +352,20 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.0",
+                "version": "1.0.3",
                 "uptime": f"{h}h {m}m {s}s",
+                "channels_discovered": len(self.channels),
+                "channels_updated": time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(self.channels_time)
+                ) if self.channels_time else None,
                 "active_streams": sum(len(v) for v in self.active.values()),
                 "active_channels": list(self.active.keys()),
                 "total_served": self.total_served,
                 "bytes_relayed_mb": round(mb, 1),
             }
 
+
+# ── HTTP handler ─────────────────────────────────────────────────────────────
 
 class RelayHandler(BaseHTTPRequestHandler):
     server_version = "MovistarRelay/1.0"
@@ -128,40 +378,57 @@ class RelayHandler(BaseHTTPRequestHandler):
         print(f"[relay] {self.client_address[0]} {fmt % args}", flush=True)
 
     def do_GET(self):
-        path = self.path.rstrip("/")
+        path = self.path.rstrip("/").split("?")[0]
 
         m = re.match(r"/(udp|rtp)/(\d+\.\d+\.\d+\.\d+):(\d+)", path)
         if m:
-            addr = m.group(2)
-            port = int(m.group(3))
-            self._relay(addr, port)
+            self._relay(m.group(2), int(m.group(3)))
             return
 
-        if path in ("/status", "/stat"):
-            data = json.dumps(self.state.status(), indent=2)
-            self._respond(200, data.encode(), "application/json")
-            return
-
-        if path in ("", "/"):
-            body = (
-                "<html><head><title>Movistar IPTV Relay</title></head><body>"
-                "<h2>Movistar IPTV Relay</h2>"
-                "<p>Uso: <code>/udp/239.x.x.x:8208/</code></p>"
-                "<p><a href='/status'>Estado</a></p>"
-                "</body></html>"
-            )
-            self._respond(200, body.encode(), "text/html")
-            return
-
-        self.send_error(404)
+        routes = {
+            "": self._index, "/": self._index,
+            "/status": self._status, "/stat": self._status,
+            "/channels": self._channels,
+        }
+        handler = routes.get(path)
+        if handler:
+            handler()
+        else:
+            self.send_error(404)
 
     def _respond(self, code, body, ctype):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def _index(self):
+        body = (
+            "<html><head><title>Movistar IPTV Relay</title></head><body>"
+            "<h2>Movistar IPTV Relay</h2>"
+            "<p>Uso: <code>/udp/239.x.x.x:8208/</code></p>"
+            "<p><a href='/channels'>Canales</a> | "
+            "<a href='/status'>Estado</a></p>"
+            "</body></html>"
+        )
+        self._respond(200, body, "text/html")
+
+    def _status(self):
+        self._respond(200, json.dumps(self.state.status(), indent=2),
+                      "application/json")
+
+    def _channels(self):
+        channels = self.state.get_channels()
+        if not channels:
+            self.send_error(503, "Discovery not complete yet")
+            return
+        out = {"data": {"channels": {str(k): v for k, v in channels.items()}}}
+        self._respond(200, json.dumps(out, ensure_ascii=False, indent=2),
+                      "application/json")
 
     def _relay(self, addr, port):
         key = f"{addr}:{port}"
@@ -220,10 +487,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                     continue
                 if not data:
                     break
-
                 ts_payload = strip_rtp(data)
                 buf.extend(ts_payload)
-
                 if len(buf) >= TS_SIZE * 49:
                     self.wfile.write(buf)
                     self.wfile.flush()
@@ -241,6 +506,36 @@ class RelayHandler(BaseHTTPRequestHandler):
                 pass
             sock.close()
 
+
+# ── Background discovery ─────────────────────────────────────────────────────
+
+class DiscoveryThread(threading.Thread):
+    def __init__(self, state, iptv_ip, interval=3600):
+        super().__init__(daemon=True, name="discovery")
+        self.state = state
+        self.iptv_ip = iptv_ip
+        self.interval = interval
+
+    def run(self):
+        while True:
+            try:
+                channels = discover_channels(self.iptv_ip)
+                if channels:
+                    self.state.set_channels(channels)
+                    try:
+                        with open("/data/channels_cache.json", "w") as f:
+                            json.dump(
+                                {str(k): v for k, v in channels.items()},
+                                f, ensure_ascii=False)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[discovery] Error: {e}", flush=True)
+
+            time.sleep(self.interval)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 class ThreadedHTTPServer(HTTPServer):
     allow_reuse_address = True
@@ -261,24 +556,21 @@ class ThreadedHTTPServer(HTTPServer):
 
 
 def load_ha_options():
-    opts_path = "/data/options.json"
     try:
-        with open(opts_path) as f:
+        with open("/data/options.json") as f:
             return json.load(f)
     except FileNotFoundError:
-        print(f"[relay] ERROR: {opts_path} not found", flush=True)
+        print("[relay] ERROR: /data/options.json not found", flush=True)
         sys.exit(1)
 
 
 def main():
     p = argparse.ArgumentParser(description="Movistar IPTV Multicast-to-HTTP Relay")
     p.add_argument("--port", type=int, default=4022)
-    p.add_argument("--interface", default="auto",
-                   help="Multicast interface IP (auto = detect Movistar VLAN)")
+    p.add_argument("--interface", default="auto")
     p.add_argument("--max-clients", type=int, default=10)
-    p.add_argument("--buffer", type=int, default=1024, help="UDP receive buffer (KB)")
-    p.add_argument("--ha-addon", action="store_true",
-                   help="Read config from /data/options.json (Home Assistant mode)")
+    p.add_argument("--buffer", type=int, default=1024)
+    p.add_argument("--ha-addon", action="store_true")
     args = p.parse_args()
 
     if args.ha_addon:
@@ -292,7 +584,7 @@ def main():
         iface = detect_iptv_ip()
         if not iface:
             print("[relay] ERROR: No se detecta la red IPTV de Movistar", flush=True)
-            print("[relay] Configura mcast_interface con la IP de tu interfaz en la VLAN IPTV", flush=True)
+            print("[relay] Configura mcast_interface manualmente", flush=True)
             sys.exit(1)
         print(f"[relay] Auto-detected IPTV interface: {iface}", flush=True)
     else:
@@ -300,6 +592,21 @@ def main():
         print(f"[relay] Using configured interface: {iface}", flush=True)
 
     state = RelayState()
+
+    # Load cached channels if available
+    try:
+        with open("/data/channels_cache.json") as f:
+            cached = json.load(f)
+        state.set_channels({int(k): v for k, v in cached.items()})
+        print(f"[relay] Loaded {len(cached)} cached channels", flush=True)
+    except Exception:
+        pass
+
+    # Start background discovery
+    discovery = DiscoveryThread(state, iface, interval=3600)
+    discovery.start()
+    print("[relay] Channel discovery started in background", flush=True)
+
     RelayHandler.interface = iface
     RelayHandler.buffer_kb = args.buffer
     RelayHandler.max_clients = args.max_clients
@@ -307,11 +614,13 @@ def main():
 
     server = ThreadedHTTPServer(("0.0.0.0", args.port), RelayHandler)
 
-    print(f"[relay] Movistar IPTV Relay v1.0.2", flush=True)
+    print(f"[relay] Movistar IPTV Relay v1.0.3", flush=True)
     print(f"[relay] Listening on 0.0.0.0:{args.port}", flush=True)
     print(f"[relay] Multicast interface: {iface}", flush=True)
-    print(f"[relay] Max clients: {args.max_clients}", flush=True)
-    print(f"[relay] Uso: http://<ip>:{args.port}/udp/239.x.x.x:8208/", flush=True)
+    print(f"[relay] Endpoints:", flush=True)
+    print(f"[relay]   /udp/239.x.x.x:8208/  Stream", flush=True)
+    print(f"[relay]   /channels              Channel list", flush=True)
+    print(f"[relay]   /status                Status", flush=True)
 
     try:
         server.serve_forever()
