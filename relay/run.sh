@@ -11,7 +11,7 @@ bashio::log.info "  Interfaz multicast: ${IFACE}"
 bashio::log.info "  Max clientes: ${MAX}"
 bashio::log.info "  Buffer: ${BUF} KB"
 
-exec python3 /relay.py \
+exec python3 /usr/local/bin/relay.py \
     --port "${PORT}" \
     --interface "${IFACE}" \
     --max-clients "${MAX}" \

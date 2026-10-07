@@ -3,8 +3,6 @@ FROM ${BUILD_FROM}
 
 RUN apk add --no-cache python3
 
-COPY relay.py /
-COPY run.sh /
-RUN chmod +x /run.sh
-
-CMD ["/run.sh"]
+COPY relay.py /usr/local/bin/
+COPY run.sh /etc/services.d/relay/run
+RUN chmod +x /etc/services.d/relay/run
