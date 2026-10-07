@@ -260,6 +260,16 @@ class ThreadedHTTPServer(HTTPServer):
             self.shutdown_request(request)
 
 
+def load_ha_options():
+    opts_path = "/data/options.json"
+    try:
+        with open(opts_path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"[relay] ERROR: {opts_path} not found", flush=True)
+        sys.exit(1)
+
+
 def main():
     p = argparse.ArgumentParser(description="Movistar IPTV Multicast-to-HTTP Relay")
     p.add_argument("--port", type=int, default=4022)
@@ -267,7 +277,16 @@ def main():
                    help="Multicast interface IP (auto = detect Movistar VLAN)")
     p.add_argument("--max-clients", type=int, default=10)
     p.add_argument("--buffer", type=int, default=1024, help="UDP receive buffer (KB)")
+    p.add_argument("--ha-addon", action="store_true",
+                   help="Read config from /data/options.json (Home Assistant mode)")
     args = p.parse_args()
+
+    if args.ha_addon:
+        opts = load_ha_options()
+        args.port = int(opts.get("port", 4022))
+        args.interface = opts.get("mcast_interface", "auto")
+        args.max_clients = int(opts.get("max_clients", 10))
+        args.buffer = int(opts.get("buffer_kb", 1024))
 
     if args.interface == "auto":
         iface = detect_iptv_ip()
@@ -288,7 +307,7 @@ def main():
 
     server = ThreadedHTTPServer(("0.0.0.0", args.port), RelayHandler)
 
-    print(f"[relay] Movistar IPTV Relay v1.0.0", flush=True)
+    print(f"[relay] Movistar IPTV Relay v1.0.2", flush=True)
     print(f"[relay] Listening on 0.0.0.0:{args.port}", flush=True)
     print(f"[relay] Multicast interface: {iface}", flush=True)
     print(f"[relay] Max clients: {args.max_clients}", flush=True)
