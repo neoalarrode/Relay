@@ -194,6 +194,18 @@ def parse_channels_xml(xml_str):
                 if not logged_sample:
                     tags = [c.tag.split("}")[-1] for c in svc]
                     print(f"[discovery] XML SingleService children: {tags}", flush=True)
+                    ti_tmp = svc.find(f".//{{{ns}}}TextualIdentifier")
+                    if ti_tmp is not None:
+                        print(f"[discovery] TextualIdentifier attribs: {dict(ti_tmp.attrib)}", flush=True)
+                    si_tmp = svc.find(f"{{{ns}}}ServiceInfo") or svc.find(f"{{{ns}}}SI")
+                    if si_tmp is not None:
+                        print(f"[discovery] SI children: {[c.tag.split('}')[-1] for c in si_tmp]}", flush=True)
+                        for child in si_tmp:
+                            if child.attrib:
+                                print(f"[discovery]   {child.tag.split('}')[-1]} attribs: {dict(child.attrib)}", flush=True)
+                    bd = root.find(f".//{{{ns}}}BroadcastDiscovery")
+                    if bd is not None:
+                        print(f"[discovery] BroadcastDiscovery attribs: {dict(bd.attrib)}", flush=True)
                     logged_sample = True
 
                 ti = svc.find(f".//{{{ns}}}TextualIdentifier")
