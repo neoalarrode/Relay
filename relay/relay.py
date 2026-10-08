@@ -187,36 +187,21 @@ def parse_channels_xml(xml_str):
 
                 ti = svc.find(f".//{{{ns}}}TextualIdentifier")
                 ip = svc.find(f".//{{{ns}}}IPMulticastAddress")
-                si = svc.find(f".//{{{ns}}}ServiceInfo")
+                si = svc.find(f"{{{ns}}}ServiceInfo") or svc.find(f"{{{ns}}}SI")
                 if ti is None or ip is None:
                     continue
                 ch_id = int(ti.attrib.get("ServiceName", "0"))
                 if ch_id == 0:
                     continue
-                name_el = si.find(f"{{{ns}}}Name") if si is not None else None
+
                 name = ""
-                if name_el is not None and name_el.text:
-                    try:
-                        name = name_el.text.encode("latin1").decode("utf8").strip(" .*")
-                    except (UnicodeDecodeError, UnicodeEncodeError):
-                        name = name_el.text.strip(" .*")
-                if not name and si is None:
-                    for child in svc:
-                        tag = child.tag.split("}")[-1]
-                        if tag not in ("ServiceLocation", "TextualIdentifier",
-                                       "IPMulticastAddress"):
-                            name_el = child.find(f"{{{ns}}}Name")
-                            if name_el is None:
-                                name_el = child.find("Name")
-                            if name_el is not None and name_el.text:
-                                try:
-                                    name = name_el.text.encode("latin1").decode("utf8").strip(" .*")
-                                except (UnicodeDecodeError, UnicodeEncodeError):
-                                    name = name_el.text.strip(" .*")
-                                break
-                            if child.text and child.text.strip():
-                                name = child.text.strip()
-                                break
+                if si is not None:
+                    name_el = si.find(f"{{{ns}}}Name")
+                    if name_el is not None and name_el.text:
+                        try:
+                            name = name_el.text.encode("latin1").decode("utf8").strip(" .*")
+                        except (UnicodeDecodeError, UnicodeEncodeError):
+                            name = name_el.text.strip(" .*")
 
                 genre = ""
                 if si is not None:
