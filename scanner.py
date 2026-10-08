@@ -51,7 +51,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -658,26 +658,26 @@ def find_ts_offset(data):
     return -1
 
 
-def _extract_ts_payload(data, target_pid):
+def _extract_pusi_payload(data, target_pid):
     offset = find_ts_offset(data)
     if offset < 0:
         return b""
-    payload = bytearray()
     while offset + TS_SIZE <= len(data):
         if data[offset] != TS_SYNC:
             offset += 1
             continue
+        pusi = data[offset + 1] & 0x40
         pid = ((data[offset + 1] & 0x1F) << 8) | data[offset + 2]
-        if pid == target_pid:
+        if pid == target_pid and pusi:
             has_payload = data[offset + 3] & 0x10
             has_adapt = data[offset + 3] & 0x20
             hdr = 4
             if has_adapt:
                 hdr = 5 + data[offset + 4]
             if has_payload and hdr < TS_SIZE:
-                payload.extend(data[offset + hdr:offset + TS_SIZE])
+                return bytes(data[offset + hdr:offset + TS_SIZE])
         offset += TS_SIZE
-    return bytes(payload)
+    return b""
 
 
 def check_scrambling(data):
@@ -685,13 +685,13 @@ def check_scrambling(data):
     if offset < 0:
         return False, False, 0, 0
 
-    pat = _extract_ts_payload(data, 0)
+    pat = _extract_pusi_payload(data, 0)
     if len(pat) < 12:
-        return True, False, 0, 0
+        return True, True, -1, 0
     ptr = pat[0]
     pos = 1 + ptr
     if pos + 8 > len(pat) or pat[pos] != 0x00:
-        return True, False, 0, 0
+        return True, True, -1, 0
     section_len = ((pat[pos + 1] & 0x0F) << 8) | pat[pos + 2]
     pos += 8
     pmt_pid = None
@@ -704,15 +704,15 @@ def check_scrambling(data):
             break
         pos += 4
     if pmt_pid is None:
-        return True, False, 0, 0
+        return True, True, -1, 0
 
-    pmt = _extract_ts_payload(data, pmt_pid)
+    pmt = _extract_pusi_payload(data, pmt_pid)
     if len(pmt) < 16:
-        return True, False, 0, 0
+        return True, True, -2, 0
     ptr = pmt[0]
     pos = 1 + ptr
     if pos + 12 > len(pmt) or pmt[pos] != 0x02:
-        return True, False, 0, 0
+        return True, True, -2, 0
     section_len = ((pmt[pos + 1] & 0x0F) << 8) | pmt[pos + 2]
     prog_info_len = ((pmt[pos + 10] & 0x0F) << 8) | pmt[pos + 11]
 
@@ -787,7 +787,7 @@ def scan_channel_udpxy(addr, port, udpxy_url, timeout=3):
         resp = urllib.request.urlopen(req, timeout=timeout)
         buf = bytearray()
         deadline = time.time() + timeout
-        while len(buf) < 65535 and time.time() < deadline:
+        while len(buf) < 262144 and time.time() < deadline:
             try:
                 chunk = resp.read(8192)
                 if not chunk:
