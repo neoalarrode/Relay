@@ -51,7 +51,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -658,35 +658,87 @@ def find_ts_offset(data):
     return -1
 
 
-def check_scrambling(data):
+def _extract_ts_payload(data, target_pid):
     offset = find_ts_offset(data)
     if offset < 0:
-        return False, False, 0, 0
-
-    pid_stats = {}
+        return b""
+    payload = bytearray()
     while offset + TS_SIZE <= len(data):
         if data[offset] != TS_SYNC:
             offset += 1
             continue
         pid = ((data[offset + 1] & 0x1F) << 8) | data[offset + 2]
-        tsc = (data[offset + 3] >> 6) & 0x03
-        if pid not in SI_PIDS:
-            if pid not in pid_stats:
-                pid_stats[pid] = [0, 0]
-            pid_stats[pid][0] += 1
-            if tsc != 0:
-                pid_stats[pid][1] += 1
+        if pid == target_pid:
+            has_payload = data[offset + 3] & 0x10
+            has_adapt = data[offset + 3] & 0x20
+            hdr = 4
+            if has_adapt:
+                hdr = 5 + data[offset + 4]
+            if has_payload and hdr < TS_SIZE:
+                payload.extend(data[offset + hdr:offset + TS_SIZE])
         offset += TS_SIZE
+    return bytes(payload)
 
-    if not pid_stats:
+
+def check_scrambling(data):
+    offset = find_ts_offset(data)
+    if offset < 0:
+        return False, False, 0, 0
+
+    pat = _extract_ts_payload(data, 0)
+    if len(pat) < 12:
+        return True, False, 0, 0
+    ptr = pat[0]
+    pos = 1 + ptr
+    if pos + 8 > len(pat) or pat[pos] != 0x00:
+        return True, False, 0, 0
+    section_len = ((pat[pos + 1] & 0x0F) << 8) | pat[pos + 2]
+    pos += 8
+    pmt_pid = None
+    end = min(pos + section_len - 9, len(pat) - 4)
+    while pos + 4 <= end:
+        prog_num = (pat[pos] << 8) | pat[pos + 1]
+        pid = ((pat[pos + 2] & 0x1F) << 8) | pat[pos + 3]
+        if prog_num != 0:
+            pmt_pid = pid
+            break
+        pos += 4
+    if pmt_pid is None:
         return True, False, 0, 0
 
-    total = sum(v[0] for v in pid_stats.values())
-    scrambled = sum(v[1] for v in pid_stats.values())
-    dominant_pid = max(pid_stats, key=lambda p: pid_stats[p][0])
-    d_total, d_scr = pid_stats[dominant_pid]
-    is_encrypted = d_scr > 0 and d_scr > d_total * 0.005
-    return True, is_encrypted, scrambled, total
+    pmt = _extract_ts_payload(data, pmt_pid)
+    if len(pmt) < 16:
+        return True, False, 0, 0
+    ptr = pmt[0]
+    pos = 1 + ptr
+    if pos + 12 > len(pmt) or pmt[pos] != 0x02:
+        return True, False, 0, 0
+    section_len = ((pmt[pos + 1] & 0x0F) << 8) | pmt[pos + 2]
+    prog_info_len = ((pmt[pos + 10] & 0x0F) << 8) | pmt[pos + 11]
+
+    ca_count = 0
+    i = pos + 12
+    desc_end = i + prog_info_len
+    while i + 2 <= desc_end and i < len(pmt):
+        tag, dlen = pmt[i], pmt[i + 1]
+        if tag == 0x09:
+            ca_count += 1
+        i += 2 + dlen
+
+    es_pos = desc_end
+    section_end = pos + 3 + section_len - 4
+    while es_pos + 5 <= section_end and es_pos + 5 <= len(pmt):
+        es_info_len = ((pmt[es_pos + 3] & 0x0F) << 8) | pmt[es_pos + 4]
+        i = es_pos + 5
+        es_desc_end = i + es_info_len
+        while i + 2 <= es_desc_end and i < len(pmt):
+            tag, dlen = pmt[i], pmt[i + 1]
+            if tag == 0x09:
+                ca_count += 1
+            i += 2 + dlen
+        es_pos = es_desc_end
+
+    return True, ca_count > 0, ca_count, 0
 
 
 def scan_channel(addr, port, iptv_ip, timeout=1.5, attempts=8):
@@ -1511,8 +1563,8 @@ Proxy endpoints:
             log.warning("udpxy test: no data from %s. Relay running? IPTV VLAN connected?",
                         test_ch["address"])
         else:
-            log.info("udpxy OK (%s: %s, %d/%d scrambled, %dB)",
-                     test_ch.get("name", "?"), test_result, t_scr, t_tot, t_bytes)
+            log.info("udpxy OK (%s: %s, CA_desc=%d, %dB)",
+                     test_ch.get("name", "?"), test_result, t_scr, t_bytes)
     else:
         log.info("Testing multicast connectivity: %s:%d via %s ...",
                  test_ch["address"], test_ch["port"], iptv_ip)
@@ -1527,8 +1579,8 @@ Proxy endpoints:
             log.warning("Multicast test: no data from %s. Check --iptv-ip (%s)",
                         test_ch["address"], iptv_ip)
         else:
-            log.info("Multicast OK (%s: %s, %d/%d scrambled, %dB)",
-                     test_ch.get("name", "?"), test_result, t_scr, t_tot, t_bytes)
+            log.info("Multicast OK (%s: %s, CA_desc=%d, %dB)",
+                     test_ch.get("name", "?"), test_result, t_scr, t_bytes)
 
     base_url = args.base_url or (f"http://{args.listen}:{args.port}" if args.serve else "rtp://")
 
@@ -1580,10 +1632,8 @@ Proxy endpoints:
             else:
                 offline.append((ch_id, ch))
 
-            if n_total > 0:
-                pct = n_scr * 100 // n_total
-                if 1 <= pct <= 20 or st == "error":
-                    log.info("  TSC %s: %s (%d/%d=%d%%, %dB)", st, name, n_scr, n_total, pct, n_bytes)
+            if st == "encrypted" or st == "error":
+                log.info("  %s: %s (CA_desc=%d, %dB)", st, name, n_scr, n_bytes)
 
             if i % 50 == 0 and args.serve:
                 state.update_scan(free, encrypted, offline)
