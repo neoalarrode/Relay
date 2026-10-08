@@ -51,7 +51,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -663,7 +663,7 @@ def check_scrambling(data):
     if offset < 0:
         return False, False, 0, 0
 
-    total = scrambled = 0
+    pid_stats = {}
     while offset + TS_SIZE <= len(data):
         if data[offset] != TS_SYNC:
             offset += 1
@@ -671,14 +671,22 @@ def check_scrambling(data):
         pid = ((data[offset + 1] & 0x1F) << 8) | data[offset + 2]
         tsc = (data[offset + 3] >> 6) & 0x03
         if pid not in SI_PIDS:
-            total += 1
+            if pid not in pid_stats:
+                pid_stats[pid] = [0, 0]
+            pid_stats[pid][0] += 1
             if tsc != 0:
-                scrambled += 1
+                pid_stats[pid][1] += 1
         offset += TS_SIZE
 
-    if total == 0:
+    if not pid_stats:
         return True, False, 0, 0
-    return True, scrambled > total * 0.1, scrambled, total
+
+    total = sum(v[0] for v in pid_stats.values())
+    scrambled = sum(v[1] for v in pid_stats.values())
+    dominant_pid = max(pid_stats, key=lambda p: pid_stats[p][0])
+    d_total, d_scr = pid_stats[dominant_pid]
+    is_encrypted = d_scr > 0 and d_scr > d_total * 0.005
+    return True, is_encrypted, scrambled, total
 
 
 def scan_channel(addr, port, iptv_ip, timeout=1.5, attempts=8):
