@@ -34,6 +34,7 @@ from xml.etree.ElementTree import fromstring
 TS_SYNC = 0x47
 TS_SIZE = 188
 IPTV_DNS = "172.26.23.3"
+IPTV_RES_HOST = "172.26.22.23"
 UA = "libcurl-agent/1.0 [IAL] WidgetManager Safari/538.1 CAP:803fd12a 1"
 
 END_POINTS = (
@@ -41,6 +42,11 @@ END_POINTS = (
     "http://asiptvnc.imagenio.telefonica.net:2070",
     "http://reg360.imagenio.telefonica.net:2070",
 )
+
+LOGO_DEFAULTS = {
+    "res_base": f"http://{IPTV_RES_HOST}/appclientv/nux/",
+    "logo_path": "incoming/epg/channelLogo/",
+}
 
 GENRE_MAP = {
     "0": "Otros", "1": "Cine", "2": "Noticias", "3": "Entretenimiento",
@@ -188,26 +194,8 @@ def parse_channels_xml(xml_str):
     ns = "urn:dvb:ipisdns:2006"
     try:
         root = fromstring(xml_str.replace("\n", " "))
-        logged_sample = False
         for svc in root.iter(f"{{{ns}}}SingleService"):
             try:
-                if not logged_sample:
-                    tags = [c.tag.split("}")[-1] for c in svc]
-                    print(f"[discovery] XML SingleService children: {tags}", flush=True)
-                    ti_tmp = svc.find(f".//{{{ns}}}TextualIdentifier")
-                    if ti_tmp is not None:
-                        print(f"[discovery] TextualIdentifier attribs: {dict(ti_tmp.attrib)}", flush=True)
-                    si_tmp = svc.find(f"{{{ns}}}ServiceInfo") or svc.find(f"{{{ns}}}SI")
-                    if si_tmp is not None:
-                        print(f"[discovery] SI children: {[c.tag.split('}')[-1] for c in si_tmp]}", flush=True)
-                        for child in si_tmp:
-                            if child.attrib:
-                                print(f"[discovery]   {child.tag.split('}')[-1]} attribs: {dict(child.attrib)}", flush=True)
-                    bd = root.find(f".//{{{ns}}}BroadcastDiscovery")
-                    if bd is not None:
-                        print(f"[discovery] BroadcastDiscovery attribs: {dict(bd.attrib)}", flush=True)
-                    logged_sample = True
-
                 ti = svc.find(f".//{{{ns}}}TextualIdentifier")
                 ip = svc.find(f".//{{{ns}}}IPMulticastAddress")
                 si = svc.find(f"{{{ns}}}ServiceInfo") or svc.find(f"{{{ns}}}SI")
@@ -601,6 +589,8 @@ def generate_xmltv(channels, epg):
     for ch_id, ch in sorted(channels.items(), key=lambda x: x[1].get("name", "")):
         name = ch.get("name", f"Channel {ch_id}")
         logo = ch.get("logo", "")
+        if logo and not logo.startswith("http") and not logo.startswith("/"):
+            logo = f"/logo/{logo}"
         lines.append(f'  <channel id="{ch_id}.movistar.tv">')
         lines.append(f'    <display-name>{_xml_esc(name)}</display-name>')
         if logo:
@@ -655,13 +645,37 @@ def generate_xmltv(channels, epg):
     return "\n".join(lines)
 
 
+def get_logo_base_url(endpoint):
+    try:
+        platform = api_call(endpoint, "getPlatformProfile")
+        config = api_call(endpoint, "getConfigurationParams")
+        if platform and config:
+            res_base = platform.get("RES_BASE_URI") or platform.get("res_BASE_URI", "")
+            logo_path = config.get("tvChannelLogoPath", LOGO_DEFAULTS["logo_path"])
+            if res_base:
+                try:
+                    from urllib.parse import urlparse, urlunparse
+                    parsed = urlparse(res_base)
+                    resolved = urlunparse(parsed._replace(netloc=IPTV_RES_HOST))
+                    base = resolved.rstrip("/") + "/" + logo_path
+                except Exception:
+                    base = LOGO_DEFAULTS["res_base"] + logo_path
+                print(f"[discovery] Logo base URL: {base}", flush=True)
+                return base
+    except Exception as e:
+        print(f"[discovery] Logo URL fetch error: {e}", flush=True)
+    base = LOGO_DEFAULTS["res_base"] + LOGO_DEFAULTS["logo_path"]
+    print(f"[discovery] Using default logo base: {base}", flush=True)
+    return base
+
+
 def discover_channels(iptv_ip):
     print("[discovery] Discovering Movistar network...", flush=True)
 
     endpoint = find_endpoint()
     if not endpoint:
         print("[discovery] Cannot reach Movistar API", flush=True)
-        return {}, {}, None
+        return {}, {}, None, ""
 
     print(f"[discovery] API: {endpoint}", flush=True)
 
@@ -669,16 +683,18 @@ def discover_channels(iptv_ip):
     platform = api_call(endpoint, "getPlatformProfile")
     if not client or not platform:
         print("[discovery] Failed to get profiles", flush=True)
-        return {}, {}, None
+        return {}, {}, None, ""
 
     dem = client.get("demarcation", 0)
     pkgs = client.get("tvPackages", "")
     print(f"[discovery] Demarcation: {dem} | Packages: {pkgs}", flush=True)
 
+    logo_base = get_logo_base_url(endpoint)
+
     dvb_ep = platform.get("dvbConfig", {}).get("dvbipiEntryPoint", "")
     if ":" not in dvb_ep:
         print("[discovery] No DVB entry point", flush=True)
-        return {}, {}, None
+        return {}, {}, None, logo_base
 
     grp, port = dvb_ep.split(":")
     print(f"[discovery] DVB entry: {grp}:{port}", flush=True)
@@ -686,14 +702,14 @@ def discover_channels(iptv_ip):
     dem_xml = download_dvb_xml(grp, int(port), iptv_ip, timeout=30)
     if "1_0" not in dem_xml:
         print("[discovery] Failed DVB demarcation download", flush=True)
-        return {}, {}, None
+        return {}, {}, None, logo_base
 
     result = re.findall(
         f"DEM_{dem}" + r'\..*?Address="(.*?)".*?\s*Port="(.*?)".*?',
         dem_xml["1_0"], re.DOTALL)
     if not result:
         print(f"[discovery] Demarcation {dem} not found in DVB data", flush=True)
-        return {}, {}, None
+        return {}, {}, None, logo_base
 
     sp_grp, sp_port = result[0]
     print(f"[discovery] Service provider: {sp_grp}:{sp_port}", flush=True)
@@ -724,7 +740,7 @@ def discover_channels(iptv_ip):
     print(f"[discovery] EPG segments: {len(segments)}", flush=True)
 
     print(f"[discovery] Found {len(channels)} channels", flush=True)
-    return channels, segments, endpoint
+    return channels, segments, endpoint, logo_base
 
 
 # ── State ────────────────────────────────────────────────────────────────────
@@ -742,6 +758,9 @@ class RelayState:
         self.epg_time = None
         self.xmltv = ""
         self.xmltv_gz = b""
+        self.logo_base = LOGO_DEFAULTS["res_base"] + LOGO_DEFAULTS["logo_path"]
+        self._logo_cache = {}
+        self._logo_lock = threading.Lock()
 
     def set_channels(self, channels):
         with self.lock:
@@ -778,6 +797,24 @@ class RelayState:
         with self.lock:
             return self.xmltv
 
+    def get_logo(self, filename):
+        with self._logo_lock:
+            cached = self._logo_cache.get(filename)
+            if cached:
+                return cached
+        url = self.logo_base + filename
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            resp = urllib.request.urlopen(req, timeout=10)
+            data = resp.read()
+            ctype = resp.headers.get("Content-Type", "image/jpeg")
+            with self._logo_lock:
+                if len(self._logo_cache) < 1000:
+                    self._logo_cache[filename] = (data, ctype)
+            return (data, ctype)
+        except Exception:
+            return None
+
     def connect(self, key, client):
         with self.lock:
             if key not in self.active:
@@ -806,7 +843,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.8",
+                "version": "1.0.9",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
@@ -844,6 +881,11 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._relay(m.group(2), int(m.group(3)))
             return
 
+        logo_m = re.match(r"/logo/(.+\.(?:jpg|png|gif|webp))", path)
+        if logo_m:
+            self._logo(logo_m.group(1))
+            return
+
         routes = {
             "": self._index, "/": self._index,
             "/status": self._status, "/stat": self._status,
@@ -870,10 +912,11 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _index(self):
         body = (
             "<html><head><title>Movistar IPTV Relay</title></head><body>"
-            "<h2>Movistar IPTV Relay v1.0.8</h2>"
+            "<h2>Movistar IPTV Relay v1.0.9</h2>"
             "<p>Uso: <code>/udp/239.x.x.x:8208/</code></p>"
             "<p><a href='/channels'>Canales</a> | "
             "<a href='/guide.xml'>EPG (XMLTV)</a> | "
+            "<a href='/logo/5338.jpg'>Logo test</a> | "
             "<a href='/status'>Estado</a></p>"
             "</body></html>"
         )
@@ -888,7 +931,16 @@ class RelayHandler(BaseHTTPRequestHandler):
         if not channels:
             self.send_error(503, "Discovery not complete yet")
             return
-        out = {"data": {"channels": {str(k): v for k, v in channels.items()}}}
+        host = self.headers.get("Host", "localhost:4022")
+        base = f"http://{host}/logo/"
+        enriched = {}
+        for k, v in channels.items():
+            ch = dict(v)
+            logo = ch.get("logo", "")
+            if logo and not logo.startswith("http"):
+                ch["logo"] = base + logo
+            enriched[str(k)] = ch
+        out = {"data": {"channels": enriched}}
         self._respond(200, json.dumps(out, ensure_ascii=False, indent=2),
                       "application/json")
 
@@ -909,6 +961,20 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             self._respond(200, xmltv, "application/xml; charset=utf-8")
+
+    def _logo(self, filename):
+        result = self.state.get_logo(filename)
+        if not result:
+            self.send_error(404, "Logo not found")
+            return
+        data, ctype = result
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _guide_gz(self):
         gz = self.state.get_xmltv_gz()
@@ -1012,7 +1078,9 @@ class DiscoveryThread(threading.Thread):
     def run(self):
         while True:
             try:
-                channels, segments, endpoint = discover_channels(self.iptv_ip)
+                channels, segments, endpoint, logo_base = discover_channels(self.iptv_ip)
+                if logo_base:
+                    self.state.logo_base = logo_base
                 if not channels:
                     print("[discovery] No channels found", flush=True)
                     time.sleep(self.interval)
@@ -1162,13 +1230,14 @@ def main():
 
     server = ThreadedHTTPServer(("0.0.0.0", args.port), RelayHandler)
 
-    print(f"[relay] Movistar IPTV Relay v1.0.8", flush=True)
+    print(f"[relay] Movistar IPTV Relay v1.0.9", flush=True)
     print(f"[relay] Listening on 0.0.0.0:{args.port}", flush=True)
     print(f"[relay] Multicast interface: {iface}", flush=True)
     print(f"[relay] Endpoints:", flush=True)
     print(f"[relay]   /udp/239.x.x.x:8208/  Stream", flush=True)
     print(f"[relay]   /channels              Channel list", flush=True)
     print(f"[relay]   /guide.xml             EPG (XMLTV)", flush=True)
+    print(f"[relay]   /logo/<file>.jpg        Channel logo proxy", flush=True)
     print(f"[relay]   /status                Status", flush=True)
 
     try:
