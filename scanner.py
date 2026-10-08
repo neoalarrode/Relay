@@ -51,7 +51,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -749,8 +749,7 @@ def scan_channel_udpxy(addr, port, udpxy_url, timeout=3):
             pass
         if not buf:
             return "offline", 0, 0, len(buf)
-        ts_data = strip_rtp(bytes(buf))
-        has, scr, n_scr, n_total = check_scrambling(ts_data)
+        has, scr, n_scr, n_total = check_scrambling(bytes(buf))
         if not has:
             return "offline", 0, 0, len(buf)
         result = "encrypted" if scr else "free"
