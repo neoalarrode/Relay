@@ -50,10 +50,10 @@ def detect_iptv_ip():
         except OSError:
             continue
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ip = info[4][0]
-            if ip.startswith("192.168.2."):
-                return ip
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(2)
+            s.connect(("8.8.8.8", 53))
+            return s.getsockname()[0]
     except OSError:
         pass
     return None
@@ -177,8 +177,14 @@ def parse_channels_xml(xml_str):
     ns = "urn:dvb:ipisdns:2006"
     try:
         root = fromstring(xml_str.replace("\n", " "))
-        for svc in root[0][0].iter(f"{{{ns}}}SingleService"):
+        logged_sample = False
+        for svc in root.iter(f"{{{ns}}}SingleService"):
             try:
+                if not logged_sample:
+                    tags = [c.tag.split("}")[-1] for c in svc]
+                    print(f"[discovery] XML SingleService children: {tags}", flush=True)
+                    logged_sample = True
+
                 ti = svc.find(f".//{{{ns}}}TextualIdentifier")
                 ip = svc.find(f".//{{{ns}}}IPMulticastAddress")
                 si = svc.find(f".//{{{ns}}}ServiceInfo")
@@ -194,14 +200,34 @@ def parse_channels_xml(xml_str):
                         name = name_el.text.encode("latin1").decode("utf8").strip(" .*")
                     except (UnicodeDecodeError, UnicodeEncodeError):
                         name = name_el.text.strip(" .*")
-                genre_parent = si.find(f"{{{ns}}}Genre") if si is not None else None
-                genre_el = genre_parent.find(f"{{{ns}}}Name") if genre_parent is not None else None
+                if not name and si is None:
+                    for child in svc:
+                        tag = child.tag.split("}")[-1]
+                        if tag not in ("ServiceLocation", "TextualIdentifier",
+                                       "IPMulticastAddress"):
+                            name_el = child.find(f"{{{ns}}}Name")
+                            if name_el is None:
+                                name_el = child.find("Name")
+                            if name_el is not None and name_el.text:
+                                try:
+                                    name = name_el.text.encode("latin1").decode("utf8").strip(" .*")
+                                except (UnicodeDecodeError, UnicodeEncodeError):
+                                    name = name_el.text.strip(" .*")
+                                break
+                            if child.text and child.text.strip():
+                                name = child.text.strip()
+                                break
+
                 genre = ""
-                if genre_el is not None and genre_el.text:
-                    try:
-                        genre = genre_el.text.encode("latin1").decode("utf8")
-                    except (UnicodeDecodeError, UnicodeEncodeError):
-                        genre = genre_el.text
+                if si is not None:
+                    genre_parent = si.find(f"{{{ns}}}Genre")
+                    genre_el = genre_parent.find(f"{{{ns}}}Name") if genre_parent is not None else None
+                    if genre_el is not None and genre_el.text:
+                        try:
+                            genre = genre_el.text.encode("latin1").decode("utf8")
+                        except (UnicodeDecodeError, UnicodeEncodeError):
+                            genre = genre_el.text
+
                 channels[ch_id] = {
                     "id": ch_id,
                     "address": ip.attrib["Address"],
@@ -209,7 +235,9 @@ def parse_channels_xml(xml_str):
                     "name": name or f"Channel {ch_id}",
                     "genre": genre,
                 }
-                repl = si.find(f"{{{ns}}}ReplacementService") if si is not None else None
+
+                repl_parent = si if si is not None else svc
+                repl = repl_parent.find(f".//{{{ns}}}ReplacementService")
                 if repl is not None:
                     repl_ti = repl.find(f"{{{ns}}}TextualIdentifier")
                     if repl_ti is not None:
@@ -217,6 +245,9 @@ def parse_channels_xml(xml_str):
                             repl_ti.attrib.get("ServiceName", "0"))
             except (KeyError, ValueError, AttributeError):
                 continue
+
+        named = sum(1 for c in channels.values() if not c["name"].startswith("Channel "))
+        print(f"[discovery] XML parse: {len(channels)} channels, {named} with names", flush=True)
     except Exception as e:
         print(f"[discovery] Channel XML parse error: {e}", flush=True)
     return channels
@@ -243,6 +274,33 @@ def parse_packages_xml(xml_str):
     except Exception as e:
         print(f"[discovery] Package XML parse error: {e}", flush=True)
     return packages
+
+
+def enrich_names_from_api(endpoint, channels):
+    """Fetch channel names from Movistar EPG API for channels missing names."""
+    missing = [cid for cid, ch in channels.items() if ch["name"].startswith("Channel ")]
+    if not missing:
+        return
+    print(f"[discovery] Enriching {len(missing)} channels from API...", flush=True)
+    found = 0
+    for cid in missing:
+        try:
+            data = api_call(endpoint, f"getEpg&channelID={cid}&first=0&numItems=1")
+            if not data:
+                continue
+            items = data if isinstance(data, list) else data.get("items", data.get("epg", []))
+            if items and isinstance(items, list) and len(items) > 0:
+                name = items[0].get("channelName", items[0].get("channel", ""))
+                if name:
+                    try:
+                        name = name.encode("latin1").decode("utf8")
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        pass
+                    channels[cid]["name"] = name.strip()
+                    found += 1
+        except Exception:
+            continue
+    print(f"[discovery] API enrichment: {found}/{len(missing)} names resolved", flush=True)
 
 
 def discover_channels(iptv_ip):
@@ -289,7 +347,14 @@ def discover_channels(iptv_ip):
     print(f"[discovery] Service provider: {sp_grp}:{sp_port}", flush=True)
 
     sp_xml = download_dvb_xml(sp_grp, int(sp_port), iptv_ip, timeout=60)
-    channels = parse_channels_xml(sp_xml.get("2_0", ""))
+    sp_files = sorted(sp_xml.keys())
+    print(f"[discovery] SP files downloaded: {sp_files}", flush=True)
+    xml_2_0 = sp_xml.get("2_0", "")
+    if xml_2_0:
+        print(f"[discovery] SP 2_0 size: {len(xml_2_0)} chars", flush=True)
+        print(f"[discovery] SP 2_0 preview: {xml_2_0[:300]}", flush=True)
+
+    channels = parse_channels_xml(xml_2_0)
     packages = parse_packages_xml(sp_xml.get("5_0", ""))
 
     services = {}
@@ -298,6 +363,10 @@ def discover_channels(iptv_ip):
     for ch_id in channels:
         if str(ch_id) in services:
             channels[ch_id]["dial"] = services[str(ch_id)]
+
+    named = sum(1 for c in channels.values() if not c["name"].startswith("Channel "))
+    if named < len(channels) // 2:
+        enrich_names_from_api(endpoint, channels)
 
     print(f"[discovery] Found {len(channels)} channels", flush=True)
     return channels
@@ -352,7 +421,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.3",
+                "version": "1.0.4",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
