@@ -320,12 +320,28 @@ def parse_segments_xml(xml_str):
     return segments
 
 
+_epg_xml_debug = False
+
 def parse_epg_xml(xml_str, channels):
+    global _epg_xml_debug
     programs = defaultdict(dict)
     try:
         root = fromstring(xml_str.replace("\n", " "))
     except Exception:
         return programs
+
+    if not _epg_xml_debug:
+        _epg_xml_debug = True
+        tags = set()
+        for el in root.iter():
+            tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+            tags.add(tag)
+            if len(tags) > 30:
+                break
+        print(f"[epg] DEBUG XML root={root.tag} element_tags={sorted(tags)}", flush=True)
+        if len(list(root)) > 0:
+            first = list(root)[0]
+            print(f"[epg] DEBUG first child: tag={first.tag} attribs={dict(first.attrib)}", flush=True)
 
     for event in root.iter("event"):
         try:
@@ -383,7 +399,12 @@ def download_epg_binary(segments, iptv_ip, channels, timeout_per_day=45):
         print(f"[epg] Downloading EPG day {day_num} from {addr}:{port}...", flush=True)
 
         xml_files = download_dvb_xml(addr, port, iptv_ip, timeout=timeout_per_day)
+        print(f"[epg] Day {day_num}: {len(xml_files)} files downloaded "
+              f"({', '.join(f'{k}={len(v)}b' for k, v in xml_files.items())})", flush=True)
         for fname, xml_str in xml_files.items():
+            if day_num == 0 and not total_programs:
+                preview = xml_str[:500].replace("\n", " ")
+                print(f"[epg] DEBUG file {fname} preview: {preview}", flush=True)
             try:
                 programs = parse_epg_xml(xml_str, channels)
                 for ch_id, progs in programs.items():
@@ -400,9 +421,14 @@ def download_epg_from_api(endpoint, channels):
     epg = defaultdict(dict)
     total = 0
 
+    debug_logged = False
     for ch_id in channels:
         try:
             data = api_call(endpoint, f"getEpg&channelID={ch_id}&first=0&numItems=200")
+            if not debug_logged:
+                print(f"[epg] DEBUG API ch {ch_id} raw response type={type(data).__name__} "
+                      f"preview={str(data)[:300]}", flush=True)
+                debug_logged = True
             if not data:
                 continue
             items = data if isinstance(data, list) else data.get("items", data.get("epg", []))
