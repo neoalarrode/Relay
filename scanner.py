@@ -245,11 +245,11 @@ def parse_channels_xml(xml_str):
     ns = "urn:dvb:ipisdns:2006"
     try:
         root = fromstring(xml_str.replace("\n", " "))
-        for svc in root[0][0].iter(f"{{{ns}}}SingleService"):
+        for svc in root.iter(f"{{{ns}}}SingleService"):
             try:
                 ti = svc.find(f".//{{{ns}}}TextualIdentifier")
                 ip = svc.find(f".//{{{ns}}}IPMulticastAddress")
-                si = svc.find(f".//{{{ns}}}ServiceInfo")
+                si = svc.find(f"{{{ns}}}ServiceInfo") or svc.find(f"{{{ns}}}SI")
                 if ti is None or ip is None:
                     continue
 
@@ -257,8 +257,8 @@ def parse_channels_xml(xml_str):
                 if ch_id == 0:
                     continue
 
-                name_el = si.find(f"{{{ns}}}Name") if si is not None else None
                 name = ""
+                name_el = si.find(f"{{{ns}}}Name") if si is not None else None
                 if name_el is not None and name_el.text:
                     try:
                         name = name_el.text.encode("latin1").decode("utf8").strip(" .*")
@@ -554,7 +554,7 @@ def generate_xmltv(channels, epg, output_path):
 
     for ch_id, ch in sorted(channels.items(), key=lambda x: x[1].get("name", "")):
         name = ch.get("name", f"Channel {ch_id}")
-        logo = ch.get("logo_uri", "")
+        logo = ch.get("logo", ch.get("logo_uri", ""))
         lines.append(f'  <channel id="{ch_id}.movistar.tv">')
         lines.append(f'    <display-name>{_xml_esc(name)}</display-name>')
         if logo:
@@ -581,21 +581,29 @@ def generate_xmltv(channels, epg, output_path):
             season = p.get("season", 0)
             episode = p.get("episode", 0)
             genre = p.get("genre", "")
-            genre_name = GENRE_MAP.get(str(genre), str(genre))
+            genre_name = ""
+            if genre:
+                genre_name = GENRE_MAP.get(str(genre)[:1], str(genre))
+            year = p.get("year", 0)
+            desc = p.get("desc", "")
+            sub_title = p.get("sub_title", "")
 
             display_title = serie if serie else title
-            subtitle = ""
-            if serie and title != serie:
-                subtitle = title.replace(serie, "").strip(" -")
 
             lines.append(f'  <programme start="{start} {tz_s}" stop="{stop} {tz_e}" channel="{ch_id}.movistar.tv">')
             lines.append(f'    <title lang="es">{_xml_esc(display_title)}</title>')
-            if subtitle:
-                lines.append(f'    <sub-title lang="es">{_xml_esc(subtitle)}</sub-title>')
+            if sub_title:
+                lines.append(f'    <sub-title lang="es">{_xml_esc(sub_title)}</sub-title>')
+            if desc:
+                lines.append(f'    <desc lang="es">{_xml_esc(desc)}</desc>')
             if genre_name:
                 lines.append(f'    <category lang="es">{_xml_esc(genre_name)}</category>')
+            if year:
+                lines.append(f'    <date>{year}</date>')
             if season and episode:
                 lines.append(f'    <episode-num system="xmltv_ns">{season - 1}.{episode - 1}.</episode-num>')
+            elif episode:
+                lines.append(f'    <episode-num system="xmltv_ns">.{episode - 1}.</episode-num>')
             lines.append(f'  </programme>')
 
     lines.append('</tv>')
@@ -738,8 +746,12 @@ def generate_m3u(channels, output_path, base_url, epg_url=None):
         name = ch.get("name", f"Channel {ch_id}")
         dial = ch.get("dial", "")
         genre = ch.get("genre", "")
+        logo = ch.get("logo", ch.get("logo_uri", ""))
 
         extras = [f'tvg-id="{ch_id}.movistar.tv"']
+        extras.append(f'tvg-name="{name}"')
+        if logo:
+            extras.append(f'tvg-logo="{logo}"')
         if dial:
             extras.append(f'tvg-chno="{dial}"')
         if genre:
@@ -897,7 +909,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 name = ch.get("name", str(ch_id))
                 dial = ch.get("dial", "")
                 genre = ch.get("genre", "")
+                logo = ch.get("logo", ch.get("logo_uri", ""))
                 extras = [f'tvg-id="{ch_id}.movistar.tv"']
+                extras.append(f'tvg-name="{name}"')
+                if logo:
+                    extras.append(f'tvg-logo="{logo}"')
                 if dial:
                     extras.append(f'tvg-chno="{dial}"')
                 if genre:
@@ -1209,6 +1225,19 @@ def discover_metadata(iptv_ip, proxy=None):
     return channels, segments, endpoint
 
 
+def _parse_xmltv_time(s):
+    parts = s.strip().split()
+    dt = datetime.strptime(parts[0], "%Y%m%d%H%M%S")
+    if len(parts) > 1:
+        tz_str = parts[1]
+        sign = 1 if tz_str[0] == "+" else -1
+        tz_h = int(tz_str[1:3])
+        tz_m = int(tz_str[3:5]) if len(tz_str) >= 5 else 0
+        tz = timezone(timedelta(hours=sign * tz_h, minutes=sign * tz_m))
+        dt = dt.replace(tzinfo=tz)
+    return int(dt.timestamp())
+
+
 def load_metadata_from_relay(udpxy_url):
     url = f"{udpxy_url.rstrip('/')}/channels"
     log.info("Fetching channel list from relay: %s", url)
@@ -1233,7 +1262,75 @@ def load_metadata_from_relay(udpxy_url):
         return None, {}, {}
 
     log.info("Loaded %d channels from relay", len(result))
-    return result, {}, {}
+
+    epg = {}
+    epg_url = f"{udpxy_url.rstrip('/')}/guide.xml"
+    log.info("Fetching EPG from relay: %s", epg_url)
+    try:
+        resp = urllib.request.urlopen(epg_url, timeout=30)
+        xmltv = resp.read().decode("utf-8")
+        root = fromstring(xmltv)
+        for prog in root.findall("programme"):
+            ch_tag = prog.get("channel", "")
+            ch_id = int(ch_tag.split(".")[0]) if "." in ch_tag else 0
+            if ch_id == 0:
+                continue
+            start_raw = prog.get("start", "")
+            stop_raw = prog.get("stop", "")
+            try:
+                begin = _parse_xmltv_time(start_raw)
+            except Exception:
+                continue
+            try:
+                end = _parse_xmltv_time(stop_raw)
+            except Exception:
+                end = begin + 3600
+            title_el = prog.find("title")
+            title = title_el.text if title_el is not None and title_el.text else ""
+            sub_el = prog.find("sub-title")
+            desc_el = prog.find("desc")
+            cat_el = prog.find("category")
+            date_el = prog.find("date")
+            epnum_el = prog.find("episode-num")
+
+            serie = title
+            season = 0
+            episode = 0
+            if epnum_el is not None and epnum_el.text:
+                parts = epnum_el.text.split(".")
+                try:
+                    season = int(parts[0]) + 1 if parts[0].strip() else 0
+                except ValueError:
+                    pass
+                try:
+                    episode = int(parts[1]) + 1 if len(parts) > 1 and parts[1].strip() else 0
+                except ValueError:
+                    pass
+            try:
+                year = int(date_el.text) if date_el is not None and date_el.text else 0
+            except ValueError:
+                year = 0
+
+            if ch_id not in epg:
+                epg[ch_id] = {}
+            epg[ch_id][begin] = {
+                "pid": 0,
+                "duration": end - begin,
+                "full_title": title,
+                "genre": cat_el.text if cat_el is not None and cat_el.text else "",
+                "serie": serie,
+                "season": season,
+                "episode": episode,
+                "year": year,
+                "desc": desc_el.text if desc_el is not None and desc_el.text else "",
+                "sub_title": sub_el.text if sub_el is not None and sub_el.text else "",
+            }
+        log.info("Loaded EPG from relay: %d channels, %d programs",
+                 len(epg), sum(len(p) for p in epg.values()))
+    except Exception as e:
+        log.warning("Failed to fetch EPG from relay: %s", e)
+
+    return result, {}, epg
 
 
 def load_metadata_file(path):
@@ -1403,107 +1500,16 @@ Proxy endpoints:
         else:
             log.info("Multicast OK (%s: %s)", test_ch.get("name", "?"), test_result)
 
-    # --- Scan ---
-    print(f"\nScanning {len(channels)} channels (TSC encryption check)...")
-    print("=" * 60)
-
-    free, encrypted, offline, errors = [], [], [], []
-    for i, (ch_id, ch) in enumerate(sorted(channels.items(), key=lambda x: x[1].get("name", "")), 1):
-        name = ch.get("name", str(ch_id))
-        sys.stdout.write(f"\r[{i}/{len(channels)}] {name:<40}")
-        sys.stdout.flush()
-
-        if args.udpxy:
-            st = scan_channel_udpxy(ch["address"], ch["port"], args.udpxy)
-        else:
-            st = scan_channel(ch["address"], ch["port"], iptv_ip)
-
-        if st == "free":
-            free.append((ch_id, ch))
-            sys.stdout.write(f"\r[FREE] {name:<45}\n")
-        elif st == "encrypted":
-            encrypted.append((ch_id, ch))
-            sys.stdout.write(f"\r[LOCK] {name:<45}\n")
-        elif st == "error":
-            errors.append((ch_id, ch))
-        else:
-            offline.append((ch_id, ch))
-        sys.stdout.flush()
-
-    sys.stdout.write("\r" + " " * 55 + "\r")
-    print(f"\n{'=' * 60}")
-    print(f"  Free: {len(free)}  |  Encrypted: {len(encrypted)}  |  Offline: {len(offline)}  |  Errors: {len(errors)}")
-    print(f"{'=' * 60}\n")
-
-    if errors:
-        log.warning("%d channels had scan errors (permission issue? try sudo)", len(errors))
-        for ch_id, ch in errors[:5]:
-            log.warning("  Error: %s (%s:%d)", ch.get("name"), ch["address"], ch["port"])
-
-    if free:
-        print("FREE CHANNELS:")
-        for ch_id, ch in sorted(free, key=lambda x: x[1].get("dial", x[1].get("name", "zzz"))):
-            dial = ch.get("dial", "")
-            d = f"{dial:>3}. " if dial else "     "
-            print(f"  {d}{ch['name']:<35} {ch['address']}:{ch['port']}")
-        print()
-
-    state.update_scan(free, encrypted, offline)
-
     base_url = args.base_url or (f"http://{args.listen}:{args.port}" if args.serve else "rtp://")
-    epg_url = f"http://{args.listen}:{args.port}/guide.xml.gz" if args.serve else None
 
-    free_dict = {ch_id: ch for ch_id, ch in free}
-    generate_m3u(free_dict, os.path.join(args.output_dir, "movistar_free.m3u"), base_url, epg_url)
+    # --- Load pre-existing EPG if available ---
+    if epg_preloaded:
+        state.update_epg(epg_preloaded)
+        log.info("EPG pre-loaded from relay: %d channels, %d programs",
+                 len(epg_preloaded), sum(len(p) for p in epg_preloaded.values()))
+        generate_xmltv(channels, epg_preloaded, os.path.join(args.output_dir, "guide.xml"))
 
-    # --- EPG ---
-    if not args.no_epg:
-        log.info("Loading EPG...")
-        epg = {}
-
-        if epg_preloaded:
-            epg = epg_preloaded
-            log.info("Using pre-loaded EPG from mu7d: %d channels, %d programs",
-                     len(epg), sum(len(p) for p in epg.values()))
-
-        if not epg:
-            cached_epg = os.path.join(args.output_dir, "epg_cache.json")
-            if os.path.exists(cached_epg):
-                age = time.time() - os.path.getmtime(cached_epg)
-                if age < 3600:
-                    log.info("Using cached EPG (%.0f min old)", age / 60)
-                    try:
-                        with open(cached_epg) as f:
-                            raw = json.load(f)
-                        epg = {int(k): {int(ts): v for ts, v in progs.items()} for k, progs in raw.items()}
-                    except Exception:
-                        epg = {}
-
-        if not epg:
-            if segments and iptv_ip:
-                epg = download_epg_binary(segments, iptv_ip, channels)
-            if not epg and endpoint:
-                epg = download_epg_from_api(endpoint, channels.keys(), proxy)
-            if epg:
-                try:
-                    cached_epg = os.path.join(args.output_dir, "epg_cache.json")
-                    with open(cached_epg, "w") as f:
-                        json.dump(epg, f, ensure_ascii=False)
-                except Exception as e:
-                    log.debug("Failed to cache EPG: %s", e)
-
-        if epg:
-            state.update_epg(epg)
-            generate_xmltv(channels, epg, os.path.join(args.output_dir, "guide.xml"))
-        else:
-            log.warning("No EPG data available")
-
-    # --- Exit if scan-only ---
-    if not args.serve and not args.daemon:
-        print(f"Output: {args.output_dir}/")
-        sys.exit(0)
-
-    # --- Start proxy ---
+    # --- Start proxy BEFORE scan (non-blocking) ---
     if args.serve:
         ProxyHandler.state = state
         ProxyHandler.output_dir = args.output_dir
@@ -1516,8 +1522,84 @@ Proxy endpoints:
         print(f"Proxy: http://{args.listen}:{args.port} (streams via {mode})")
         print(f"  Playlist:  http://{args.listen}:{args.port}/playlist.m3u")
         print(f"  EPG:       http://{args.listen}:{args.port}/guide.xml.gz")
-        print(f"  Channels:  {len(free)} free")
         print(f"  Status:    http://{args.listen}:{args.port}/status\n")
+
+    # --- Initial scan (non-blocking in serve+daemon mode) ---
+    def _do_initial_scan():
+        log.info("Scanning %d channels (TSC encryption check)...", len(channels))
+        free, encrypted, offline, errors = [], [], [], []
+        for i, (ch_id, ch) in enumerate(sorted(channels.items(), key=lambda x: x[1].get("name", "")), 1):
+            name = ch.get("name", str(ch_id))
+            if not args.serve:
+                sys.stdout.write(f"\r[{i}/{len(channels)}] {name:<40}")
+                sys.stdout.flush()
+
+            if args.udpxy:
+                st = scan_channel_udpxy(ch["address"], ch["port"], args.udpxy)
+            else:
+                st = scan_channel(ch["address"], ch["port"], iptv_ip)
+
+            if st == "free":
+                free.append((ch_id, ch))
+                if args.serve:
+                    state.update_scan(free, encrypted, offline)
+            elif st == "encrypted":
+                encrypted.append((ch_id, ch))
+            elif st == "error":
+                errors.append((ch_id, ch))
+            else:
+                offline.append((ch_id, ch))
+
+            if i % 50 == 0 and args.serve:
+                state.update_scan(free, encrypted, offline)
+                log.info("Scan progress: %d/%d (%d free)", i, len(channels), len(free))
+
+        state.update_scan(free, encrypted, offline)
+        log.info("Scan complete: %d free, %d encrypted, %d offline, %d errors",
+                 len(free), len(encrypted), len(offline), len(errors))
+
+        epg_url = f"http://{args.listen}:{args.port}/guide.xml.gz" if args.serve else None
+        free_dict = {ch_id: ch for ch_id, ch in free}
+        generate_m3u(free_dict, os.path.join(args.output_dir, "movistar_free.m3u"), base_url, epg_url)
+
+        if not args.no_epg and not epg_preloaded:
+            epg = {}
+            cached_epg = os.path.join(args.output_dir, "epg_cache.json")
+            if os.path.exists(cached_epg):
+                age = time.time() - os.path.getmtime(cached_epg)
+                if age < 3600:
+                    log.info("Using cached EPG (%.0f min old)", age / 60)
+                    try:
+                        with open(cached_epg) as f:
+                            raw = json.load(f)
+                        epg = {int(k): {int(ts): v for ts, v in progs.items()} for k, progs in raw.items()}
+                    except Exception:
+                        epg = {}
+
+            if not epg:
+                if segments and iptv_ip:
+                    epg = download_epg_binary(segments, iptv_ip, channels)
+                if not epg and endpoint:
+                    epg = download_epg_from_api(endpoint, channels.keys(), proxy)
+                if epg:
+                    try:
+                        with open(cached_epg, "w") as f:
+                            json.dump(epg, f, ensure_ascii=False)
+                    except Exception:
+                        pass
+
+            if epg:
+                state.update_epg(epg)
+                generate_xmltv(channels, epg, os.path.join(args.output_dir, "guide.xml"))
+
+    if args.serve and args.daemon:
+        scan_thread = threading.Thread(target=_do_initial_scan, daemon=True, name="initial-scan")
+        scan_thread.start()
+        log.info("Initial scan started in background")
+    else:
+        _do_initial_scan()
+        if not args.serve and not args.daemon:
+            sys.exit(0)
 
     # --- Start background scanner ---
     bg_scanner = None
