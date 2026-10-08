@@ -43,10 +43,9 @@ END_POINTS = (
 )
 
 GENRE_MAP = {
-    "01": "Cine", "02": "Deportes", "03": "Documentales", "04": "Infantil",
-    "05": "Musica", "06": "Otros", "07": "Programas", "08": "Series",
-    "10": "Cine", "20": "Deportes", "30": "Documentales", "40": "Infantil",
-    "50": "Musica", "60": "Otros", "70": "Programas", "80": "Series",
+    "0": "Otros", "1": "Cine", "2": "Noticias", "3": "Entretenimiento",
+    "4": "Deportes", "5": "Infantil", "6": "Musica", "7": "Cultura",
+    "8": "Sociedad", "9": "Educacion", "a": "Ocio", "b": "Especial",
 }
 
 
@@ -231,6 +230,7 @@ def parse_channels_xml(xml_str):
                     "port": int(ip.attrib["Port"]),
                     "name": name or f"Channel {ch_id}",
                     "genre": genre,
+                    "logo": ti.attrib.get("logoURI", ""),
                 }
 
                 repl_parent = si if si is not None else svc
@@ -403,10 +403,64 @@ def parse_epg_binary_data(latin1_str, channels):
         m = re.search(r"^(.+?) S(\d+)E(\d+)", title)
         if m:
             serie, season, episode = m.group(1), int(m.group(2)), int(m.group(3))
-        ep_m = re.search(r"(.+?) (?:Ep\.|T\d+\s*Ep\.?)\s*(\d+)", title)
-        if ep_m and not serie:
-            serie = ep_m.group(1).strip()
-            episode = int(ep_m.group(2))
+        te_m = re.search(r"(.+?) T(\d+)\s*Ep\.?\s*(\d+)", title)
+        if te_m and not serie:
+            serie = te_m.group(1).strip()
+            season = int(te_m.group(2))
+            episode = int(te_m.group(3))
+        elif not serie:
+            ep_m = re.search(r"(.+?) Ep\.?\s*(\d+)", title)
+            if ep_m:
+                serie = ep_m.group(1).strip()
+                episode = int(ep_m.group(2))
+
+        year = 0
+        description = ""
+        f3 = data.find(0xF3, f1)
+
+        post = data[f1 + 1:f3] if f3 != -1 and f3 > f1 else b""
+        if len(post) >= 10:
+            for yi in range(len(post) - 1):
+                yv = struct.unpack(">H", post[yi:yi + 2])[0]
+                if 2000 <= yv <= 2040:
+                    year = yv
+                    break
+
+            best_run = ""
+            run_start = -1
+            for di in range(len(post)):
+                db = post[di] ^ _EPG_XOR
+                if 0x20 <= db <= 0x7E or db >= 0x80:
+                    if run_start == -1:
+                        run_start = di
+                else:
+                    if run_start != -1 and di - run_start >= 5:
+                        candidate = _xor_decode(post[run_start:di])
+                        try:
+                            txt = candidate.decode("utf-8", errors="replace").strip()
+                        except Exception:
+                            txt = ""
+                        if len(txt) > len(best_run):
+                            best_run = txt
+                    run_start = -1
+            if run_start != -1 and len(post) - run_start >= 5:
+                candidate = _xor_decode(post[run_start:])
+                try:
+                    txt = candidate.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    txt = ""
+                if len(txt) > len(best_run):
+                    best_run = txt
+            description = best_run
+
+        sub_title = ""
+        if serie and title != serie:
+            sub_part = title.replace(serie, "").strip()
+            sub_part = re.sub(r"^[TS]\d+\s*", "", sub_part)
+            sub_part = re.sub(r"^Ep\.?\s*\d+\s*", "", sub_part)
+            sub_part = sub_part.strip(" -–—/")
+            if sub_part:
+                sub_title = sub_part
 
         programs[ch_id][begin] = {
             "pid": event_id,
@@ -416,9 +470,11 @@ def parse_epg_binary_data(latin1_str, channels):
             "serie": serie,
             "season": season,
             "episode": episode,
+            "year": year,
+            "desc": description,
+            "sub_title": sub_title,
         }
 
-        f3 = data.find(0xF3, f1)
         if f3 != -1:
             stover = data.find(b"STOVER", f3)
             pos = (stover + 6) if stover != -1 and stover - f3 < 30 else f3 + 1
@@ -490,6 +546,13 @@ def download_epg_from_api(endpoint, channels):
                 if m:
                     serie, season, episode = m.group(1), int(m.group(2)), int(m.group(3))
 
+                desc = item.get("description", item.get("shortDescription", ""))
+                year_str = item.get("productionDate", item.get("year", ""))
+                try:
+                    api_year = int(str(year_str)[:4]) if year_str else 0
+                except ValueError:
+                    api_year = 0
+
                 epg[ch_id][begin] = {
                     "pid": int(item.get("extInfoID", item.get("productID", 0))),
                     "duration": duration,
@@ -498,6 +561,9 @@ def download_epg_from_api(endpoint, channels):
                     "serie": serie,
                     "season": season,
                     "episode": episode,
+                    "year": api_year,
+                    "desc": desc,
+                    "sub_title": "",
                 }
                 total += 1
         except Exception:
@@ -522,8 +588,11 @@ def generate_xmltv(channels, epg):
 
     for ch_id, ch in sorted(channels.items(), key=lambda x: x[1].get("name", "")):
         name = ch.get("name", f"Channel {ch_id}")
+        logo = ch.get("logo", "")
         lines.append(f'  <channel id="{ch_id}.movistar.tv">')
         lines.append(f'    <display-name>{_xml_esc(name)}</display-name>')
+        if logo:
+            lines.append(f'    <icon src="{_xml_esc(logo)}" />')
         lines.append(f'  </channel>')
 
     for ch_id in sorted(epg.keys()):
@@ -545,21 +614,29 @@ def generate_xmltv(channels, epg):
             season = p.get("season", 0)
             episode = p.get("episode", 0)
             genre = p.get("genre", "")
-            genre_name = GENRE_MAP.get(str(genre), str(genre))
+            genre_name = ""
+            if genre:
+                genre_name = GENRE_MAP.get(str(genre)[:1], "")
+            year = p.get("year", 0)
+            desc = p.get("desc", "")
+            sub_title = p.get("sub_title", "")
 
             display_title = serie if serie else title
-            subtitle = ""
-            if serie and title != serie:
-                subtitle = title.replace(serie, "").strip(" -")
 
             lines.append(f'  <programme start="{start} {tz_s}" stop="{stop} {tz_e}" channel="{ch_id}.movistar.tv">')
             lines.append(f'    <title lang="es">{_xml_esc(display_title)}</title>')
-            if subtitle:
-                lines.append(f'    <sub-title lang="es">{_xml_esc(subtitle)}</sub-title>')
+            if sub_title:
+                lines.append(f'    <sub-title lang="es">{_xml_esc(sub_title)}</sub-title>')
+            if desc:
+                lines.append(f'    <desc lang="es">{_xml_esc(desc)}</desc>')
             if genre_name:
                 lines.append(f'    <category lang="es">{_xml_esc(genre_name)}</category>')
+            if year:
+                lines.append(f'    <date>{year}</date>')
             if season and episode:
                 lines.append(f'    <episode-num system="xmltv_ns">{season - 1}.{episode - 1}.</episode-num>')
+            elif episode:
+                lines.append(f'    <episode-num system="xmltv_ns">.{episode - 1}.</episode-num>')
             lines.append(f'  </programme>')
 
     lines.append('</tv>')
@@ -717,7 +794,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.7",
+                "version": "1.0.8",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
@@ -781,7 +858,7 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _index(self):
         body = (
             "<html><head><title>Movistar IPTV Relay</title></head><body>"
-            "<h2>Movistar IPTV Relay v1.0.7</h2>"
+            "<h2>Movistar IPTV Relay v1.0.8</h2>"
             "<p>Uso: <code>/udp/239.x.x.x:8208/</code></p>"
             "<p><a href='/channels'>Canales</a> | "
             "<a href='/guide.xml'>EPG (XMLTV)</a> | "
@@ -1073,7 +1150,7 @@ def main():
 
     server = ThreadedHTTPServer(("0.0.0.0", args.port), RelayHandler)
 
-    print(f"[relay] Movistar IPTV Relay v1.0.7", flush=True)
+    print(f"[relay] Movistar IPTV Relay v1.0.8", flush=True)
     print(f"[relay] Listening on 0.0.0.0:{args.port}", flush=True)
     print(f"[relay] Multicast interface: {iface}", flush=True)
     print(f"[relay] Endpoints:", flush=True)
