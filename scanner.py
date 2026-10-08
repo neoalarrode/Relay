@@ -661,7 +661,7 @@ def find_ts_offset(data):
 def check_scrambling(data):
     offset = find_ts_offset(data)
     if offset < 0:
-        return False, False
+        return False, False, 0, 0
 
     total = scrambled = 0
     while offset + TS_SIZE <= len(data):
@@ -676,7 +676,9 @@ def check_scrambling(data):
                 scrambled += 1
         offset += TS_SIZE
 
-    return (True, scrambled > total * 0.1) if total > 0 else (True, False)
+    if total == 0:
+        return True, False, 0, 0
+    return True, scrambled > total * 0.1, scrambled, total
 
 
 def scan_channel(addr, port, iptv_ip, timeout=1.5, attempts=8):
@@ -706,30 +708,49 @@ def scan_channel(addr, port, iptv_ip, timeout=1.5, attempts=8):
         sock.close()
 
         if not buf:
-            return "offline"
+            return "offline", 0, 0, 0
         ts_data = strip_rtp(bytes(buf))
-        has, scr = check_scrambling(ts_data)
+        has, scr, n_scr, n_total = check_scrambling(ts_data)
         if not has:
-            return "offline"
-        return "encrypted" if scr else "free"
+            return "offline", 0, 0, len(buf)
+        result = "encrypted" if scr else "free"
+        return result, n_scr, n_total, len(buf)
     except Exception as e:
         log.debug("scan_channel %s:%d error: %s", addr, port, e)
-        return "error"
+        return "error", 0, 0, 0
 
 
 def scan_channel_udpxy(addr, port, udpxy_url, timeout=3):
     try:
         url = f"{udpxy_url.rstrip('/')}/udp/{addr}:{port}/"
-        resp = urllib.request.urlopen(url, timeout=timeout)
-        buf = resp.read(65535 * 8)
-        resp.close()
+        req = urllib.request.Request(url)
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        buf = bytearray()
+        deadline = time.time() + timeout
+        while len(buf) < 65535 and time.time() < deadline:
+            try:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+            except Exception:
+                break
+        try:
+            resp.close()
+        except Exception:
+            pass
         if not buf:
-            return "offline"
-        ts_data = strip_rtp(buf)
-        has, scr = check_scrambling(ts_data)
-        return "encrypted" if scr else "free" if has else "offline"
+            return "offline", 0, 0, len(buf)
+        ts_data = strip_rtp(bytes(buf))
+        has, scr, n_scr, n_total = check_scrambling(ts_data)
+        if not has:
+            return "offline", 0, 0, len(buf)
+        result = "encrypted" if scr else "free"
+        return result, n_scr, n_total, len(buf)
+    except urllib.error.URLError:
+        return "offline", 0, 0, 0
     except Exception:
-        return "error"
+        return "error", 0, 0, 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1125,9 +1146,9 @@ class BackgroundScanner(threading.Thread):
 
         for ch_id, ch in sorted(channels.items(), key=lambda x: x[1].get("name", "")):
             if self.udpxy:
-                status = scan_channel_udpxy(ch["address"], ch["port"], self.udpxy)
+                status, _, _, _ = scan_channel_udpxy(ch["address"], ch["port"], self.udpxy)
             else:
-                status = scan_channel(ch["address"], ch["port"], self.iptv_ip)
+                status, _, _, _ = scan_channel(ch["address"], ch["port"], self.iptv_ip)
 
             if status == "free":
                 free.append((ch_id, ch))
@@ -1473,7 +1494,7 @@ Proxy endpoints:
     if args.udpxy:
         log.info("Testing udpxy connectivity: %s -> %s:%d ...",
                  args.udpxy, test_ch["address"], test_ch["port"])
-        test_result = scan_channel_udpxy(test_ch["address"], test_ch["port"],
+        test_result, t_scr, t_tot, t_bytes = scan_channel_udpxy(test_ch["address"], test_ch["port"],
                                          args.udpxy, timeout=5)
         if test_result == "error":
             log.error("udpxy test FAILED. Check URL: %s", args.udpxy)
@@ -1483,11 +1504,12 @@ Proxy endpoints:
             log.warning("udpxy test: no data from %s. Relay running? IPTV VLAN connected?",
                         test_ch["address"])
         else:
-            log.info("udpxy OK (%s: %s)", test_ch.get("name", "?"), test_result)
+            log.info("udpxy OK (%s: %s, %d/%d scrambled, %dB)",
+                     test_ch.get("name", "?"), test_result, t_scr, t_tot, t_bytes)
     else:
         log.info("Testing multicast connectivity: %s:%d via %s ...",
                  test_ch["address"], test_ch["port"], iptv_ip)
-        test_result = scan_channel(test_ch["address"], test_ch["port"], iptv_ip,
+        test_result, t_scr, t_tot, t_bytes = scan_channel(test_ch["address"], test_ch["port"], iptv_ip,
                                    timeout=3, attempts=12)
         if test_result == "error":
             log.error("Multicast test FAILED (error). Need sudo? Wrong --iptv-ip?")
@@ -1498,7 +1520,8 @@ Proxy endpoints:
             log.warning("Multicast test: no data from %s. Check --iptv-ip (%s)",
                         test_ch["address"], iptv_ip)
         else:
-            log.info("Multicast OK (%s: %s)", test_ch.get("name", "?"), test_result)
+            log.info("Multicast OK (%s: %s, %d/%d scrambled, %dB)",
+                     test_ch.get("name", "?"), test_result, t_scr, t_tot, t_bytes)
 
     base_url = args.base_url or (f"http://{args.listen}:{args.port}" if args.serve else "rtp://")
 
@@ -1535,9 +1558,9 @@ Proxy endpoints:
                 sys.stdout.flush()
 
             if args.udpxy:
-                st = scan_channel_udpxy(ch["address"], ch["port"], args.udpxy)
+                st, n_scr, n_total, n_bytes = scan_channel_udpxy(ch["address"], ch["port"], args.udpxy)
             else:
-                st = scan_channel(ch["address"], ch["port"], iptv_ip)
+                st, n_scr, n_total, n_bytes = scan_channel(ch["address"], ch["port"], iptv_ip)
 
             if st == "free":
                 free.append((ch_id, ch))
@@ -1549,6 +1572,11 @@ Proxy endpoints:
                 errors.append((ch_id, ch))
             else:
                 offline.append((ch_id, ch))
+
+            if n_total > 0:
+                pct = n_scr * 100 // n_total
+                if 1 <= pct <= 20 or st == "error":
+                    log.info("  TSC %s: %s (%d/%d=%d%%, %dB)", st, name, n_scr, n_total, pct, n_bytes)
 
             if i % 50 == 0 and args.serve:
                 state.update_scan(free, encrypted, offline)
