@@ -422,7 +422,7 @@ def parse_epg_binary_data(latin1_str, channels):
         if len(post) >= 10:
             for yi in range(len(post) - 1):
                 yv = struct.unpack(">H", post[yi:yi + 2])[0]
-                if 2000 <= yv <= 2040:
+                if 1920 <= yv <= 2030:
                     year = yv
                     break
 
