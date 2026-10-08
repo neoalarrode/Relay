@@ -10,10 +10,13 @@ and serves the metadata so remote scanners need only this URL.
 Endpoints:
   GET /udp/<addr>:<port>/   Stream multicast channel as HTTP
   GET /channels             Channel list (JSON) - auto-discovered
+  GET /guide.xml            EPG guide (XMLTV) - all channels
   GET /status               Relay status (JSON)
 """
 
 import argparse
+import gzip
+import io
 import json
 import re
 import socket
@@ -22,6 +25,8 @@ import sys
 import threading
 import time
 import urllib.request
+from collections import defaultdict
+from datetime import datetime
 from html import unescape
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from xml.etree.ElementTree import fromstring
@@ -36,6 +41,13 @@ END_POINTS = (
     "http://asiptvnc.imagenio.telefonica.net:2070",
     "http://reg360.imagenio.telefonica.net:2070",
 )
+
+GENRE_MAP = {
+    "01": "Cine", "02": "Deportes", "03": "Documentales", "04": "Infantil",
+    "05": "Musica", "06": "Otros", "07": "Programas", "08": "Series",
+    "10": "Cine", "20": "Deportes", "30": "Documentales", "40": "Infantil",
+    "50": "Musica", "60": "Otros", "70": "Programas", "80": "Series",
+}
 
 
 # ── Network detection ────────────────────────────────────────────────────────
@@ -288,13 +300,214 @@ def enrich_names_from_api(endpoint, channels):
     print(f"[discovery] API enrichment: {found}/{len(missing)} names resolved", flush=True)
 
 
+# ── EPG: Download & Parse ───────────────────────────────────────────────────
+
+def parse_segments_xml(xml_str):
+    segments = {}
+    ns = "urn:dvb:ipisdns:2006"
+    try:
+        root = fromstring(xml_str.replace("\n", " "))
+        for seg in root.iter(f"{{{ns}}}DVBBINSTP"):
+            source = seg.attrib.get("Source", "")
+            if "EPG" in source:
+                segments[source] = {
+                    "Source": source,
+                    "Port": int(seg.attrib["Port"]),
+                    "Address": seg.attrib["Address"],
+                }
+    except Exception as e:
+        print(f"[epg] Segments XML parse error: {e}", flush=True)
+    return segments
+
+
+def parse_epg_xml(xml_str, channels):
+    programs = defaultdict(dict)
+    try:
+        root = fromstring(xml_str.replace("\n", " "))
+    except Exception:
+        return programs
+
+    for event in root.iter("event"):
+        try:
+            ch_id = int(event.attrib.get("channel_id",
+                        event.attrib.get("serviceUID", 0)))
+            if ch_id == 0:
+                continue
+            begin = int(event.attrib.get("beginTime",
+                        event.attrib.get("begin_time", 0)))
+            if begin > 1e12:
+                begin //= 1000
+            duration = int(event.attrib.get("duration", 0))
+            if duration > 1e6:
+                duration //= 1000
+            title = event.attrib.get("name", event.attrib.get("title", ""))
+            try:
+                title = title.encode("latin1").decode("utf8")
+            except (UnicodeDecodeError, UnicodeEncodeError, AttributeError):
+                pass
+            title = re.sub(r"(\d+)/(\d+)", r"\1\2", title).strip()
+
+            genre = event.attrib.get("genre", event.attrib.get("labelGenre", ""))
+            genre_id = event.attrib.get("genreID", event.attrib.get("themeID", ""))
+
+            serie = ""
+            season = episode = 0
+            m = re.search(r"^(.+?) S(\d+)E(\d+)", title)
+            if m:
+                serie, season, episode = m.group(1), int(m.group(2)), int(m.group(3))
+
+            programs[ch_id][begin] = {
+                "pid": int(event.attrib.get("extInfoID",
+                           event.attrib.get("pid", event.attrib.get("id", 0)))),
+                "duration": duration,
+                "full_title": title,
+                "genre": genre_id or genre,
+                "serie": serie,
+                "season": season,
+                "episode": episode,
+            }
+        except (KeyError, ValueError):
+            continue
+    return programs
+
+
+def download_epg_binary(segments, iptv_ip, channels, timeout_per_day=45):
+    epg = defaultdict(dict)
+    total_programs = 0
+
+    for source, seg in sorted(segments.items()):
+        addr = seg["Address"]
+        port = seg["Port"]
+        day_match = re.search(r"EPG_(\d+)_BIN", source)
+        day_num = int(day_match.group(1)) if day_match else -1
+        print(f"[epg] Downloading EPG day {day_num} from {addr}:{port}...", flush=True)
+
+        xml_files = download_dvb_xml(addr, port, iptv_ip, timeout=timeout_per_day)
+        for fname, xml_str in xml_files.items():
+            try:
+                programs = parse_epg_xml(xml_str, channels)
+                for ch_id, progs in programs.items():
+                    epg[ch_id].update(progs)
+                    total_programs += len(progs)
+            except Exception as e:
+                print(f"[epg] Parse error {source}/{fname}: {e}", flush=True)
+
+    print(f"[epg] Binary: {total_programs} programs across {len(epg)} channels", flush=True)
+    return dict(epg)
+
+
+def download_epg_from_api(endpoint, channels):
+    epg = defaultdict(dict)
+    total = 0
+
+    for ch_id in channels:
+        try:
+            data = api_call(endpoint, f"getEpg&channelID={ch_id}&first=0&numItems=200")
+            if not data:
+                continue
+            items = data if isinstance(data, list) else data.get("items", data.get("epg", []))
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                begin = int(item.get("beginTime", 0))
+                if begin > 1e12:
+                    begin //= 1000
+                duration = int(item.get("duration", 0))
+                if duration > 1e6:
+                    duration //= 1000
+                title = item.get("name", item.get("title", ""))
+                genre = item.get("labelGenre", item.get("genre", ""))
+                genre_id = item.get("themeID", item.get("genreID", ""))
+
+                serie = ""
+                season = episode = 0
+                m = re.search(r"^(.+?) S(\d+)E(\d+)", title)
+                if m:
+                    serie, season, episode = m.group(1), int(m.group(2)), int(m.group(3))
+
+                epg[ch_id][begin] = {
+                    "pid": int(item.get("extInfoID", item.get("productID", 0))),
+                    "duration": duration,
+                    "full_title": title,
+                    "genre": genre_id or genre,
+                    "serie": serie,
+                    "season": season,
+                    "episode": episode,
+                }
+                total += 1
+        except Exception:
+            continue
+
+    print(f"[epg] API: {total} programs across {len(epg)} channels", flush=True)
+    return dict(epg)
+
+
+def _xml_esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def generate_xmltv(channels, epg):
+    tz_offset = time.timezone // -3600
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<!DOCTYPE tv SYSTEM "xmltv.dtd">',
+        '<tv generator-info-name="movistar-relay" generator-info-url="">',
+    ]
+
+    for ch_id, ch in sorted(channels.items(), key=lambda x: x[1].get("name", "")):
+        name = ch.get("name", f"Channel {ch_id}")
+        lines.append(f'  <channel id="{ch_id}.movistar.tv">')
+        lines.append(f'    <display-name>{_xml_esc(name)}</display-name>')
+        lines.append(f'  </channel>')
+
+    for ch_id in sorted(epg.keys()):
+        programs = epg[ch_id]
+        for ts in sorted(programs.keys()):
+            p = programs[ts]
+            duration = p.get("duration", 0)
+            if not duration:
+                continue
+            dst_s = time.localtime(ts).tm_isdst
+            dst_e = time.localtime(ts + duration).tm_isdst
+            start = datetime.fromtimestamp(ts).strftime("%Y%m%d%H%M%S")
+            stop = datetime.fromtimestamp(ts + duration).strftime("%Y%m%d%H%M%S")
+            tz_s = f"+{tz_offset + dst_s:02d}00"
+            tz_e = f"+{tz_offset + dst_e:02d}00"
+
+            title = p.get("full_title", "")
+            serie = p.get("serie", "")
+            season = p.get("season", 0)
+            episode = p.get("episode", 0)
+            genre = p.get("genre", "")
+            genre_name = GENRE_MAP.get(str(genre), str(genre))
+
+            display_title = serie if serie else title
+            subtitle = ""
+            if serie and title != serie:
+                subtitle = title.replace(serie, "").strip(" -")
+
+            lines.append(f'  <programme start="{start} {tz_s}" stop="{stop} {tz_e}" channel="{ch_id}.movistar.tv">')
+            lines.append(f'    <title lang="es">{_xml_esc(display_title)}</title>')
+            if subtitle:
+                lines.append(f'    <sub-title lang="es">{_xml_esc(subtitle)}</sub-title>')
+            if genre_name:
+                lines.append(f'    <category lang="es">{_xml_esc(genre_name)}</category>')
+            if season and episode:
+                lines.append(f'    <episode-num system="xmltv_ns">{season - 1}.{episode - 1}.</episode-num>')
+            lines.append(f'  </programme>')
+
+    lines.append('</tv>')
+    return "\n".join(lines)
+
+
 def discover_channels(iptv_ip):
     print("[discovery] Discovering Movistar network...", flush=True)
 
     endpoint = find_endpoint()
     if not endpoint:
         print("[discovery] Cannot reach Movistar API", flush=True)
-        return {}
+        return {}, {}, None
 
     print(f"[discovery] API: {endpoint}", flush=True)
 
@@ -302,7 +515,7 @@ def discover_channels(iptv_ip):
     platform = api_call(endpoint, "getPlatformProfile")
     if not client or not platform:
         print("[discovery] Failed to get profiles", flush=True)
-        return {}
+        return {}, {}, None
 
     dem = client.get("demarcation", 0)
     pkgs = client.get("tvPackages", "")
@@ -311,7 +524,7 @@ def discover_channels(iptv_ip):
     dvb_ep = platform.get("dvbConfig", {}).get("dvbipiEntryPoint", "")
     if ":" not in dvb_ep:
         print("[discovery] No DVB entry point", flush=True)
-        return {}
+        return {}, {}, None
 
     grp, port = dvb_ep.split(":")
     print(f"[discovery] DVB entry: {grp}:{port}", flush=True)
@@ -319,14 +532,14 @@ def discover_channels(iptv_ip):
     dem_xml = download_dvb_xml(grp, int(port), iptv_ip, timeout=30)
     if "1_0" not in dem_xml:
         print("[discovery] Failed DVB demarcation download", flush=True)
-        return {}
+        return {}, {}, None
 
     result = re.findall(
         f"DEM_{dem}" + r'\..*?Address="(.*?)".*?\s*Port="(.*?)".*?',
         dem_xml["1_0"], re.DOTALL)
     if not result:
         print(f"[discovery] Demarcation {dem} not found in DVB data", flush=True)
-        return {}
+        return {}, {}, None
 
     sp_grp, sp_port = result[0]
     print(f"[discovery] Service provider: {sp_grp}:{sp_port}", flush=True)
@@ -353,8 +566,11 @@ def discover_channels(iptv_ip):
     if named < len(channels) // 2:
         enrich_names_from_api(endpoint, channels)
 
+    segments = parse_segments_xml(sp_xml.get("6_0", ""))
+    print(f"[discovery] EPG segments: {len(segments)}", flush=True)
+
     print(f"[discovery] Found {len(channels)} channels", flush=True)
-    return channels
+    return channels, segments, endpoint
 
 
 # ── State ────────────────────────────────────────────────────────────────────
@@ -368,6 +584,10 @@ class RelayState:
         self.bytes_relayed = 0
         self.channels = {}
         self.channels_time = None
+        self.epg = {}
+        self.epg_time = None
+        self.xmltv = ""
+        self.xmltv_gz = b""
 
     def set_channels(self, channels):
         with self.lock:
@@ -377,6 +597,32 @@ class RelayState:
     def get_channels(self):
         with self.lock:
             return dict(self.channels)
+
+    def set_epg(self, epg, channels):
+        with self.lock:
+            self.epg = epg
+            self.epg_time = time.time()
+            xmltv = generate_xmltv(channels, epg)
+            self.xmltv = xmltv
+            buf = io.BytesIO()
+            with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+                gz.write(xmltv.encode("utf-8"))
+            self.xmltv_gz = buf.getvalue()
+            try:
+                with open("/data/epg_cache.json", "w") as f:
+                    json.dump({str(k): v for k, v in epg.items()}, f)
+            except Exception:
+                pass
+            print(f"[epg] XMLTV generated: {len(epg)} channels, "
+                  f"{sum(len(p) for p in epg.values())} programs", flush=True)
+
+    def get_xmltv_gz(self):
+        with self.lock:
+            return self.xmltv_gz
+
+    def get_xmltv(self):
+        with self.lock:
+            return self.xmltv
 
     def connect(self, key, client):
         with self.lock:
@@ -406,12 +652,17 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.4",
+                "version": "1.0.5",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
                     "%Y-%m-%d %H:%M", time.localtime(self.channels_time)
                 ) if self.channels_time else None,
+                "epg_channels": len(self.epg),
+                "epg_programs": sum(len(p) for p in self.epg.values()),
+                "epg_updated": time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(self.epg_time)
+                ) if self.epg_time else None,
                 "active_streams": sum(len(v) for v in self.active.values()),
                 "active_channels": list(self.active.keys()),
                 "total_served": self.total_served,
@@ -443,6 +694,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             "": self._index, "/": self._index,
             "/status": self._status, "/stat": self._status,
             "/channels": self._channels,
+            "/guide.xml": self._guide, "/epg.xml": self._guide,
+            "/guide.xml.gz": self._guide_gz, "/epg.xml.gz": self._guide_gz,
         }
         handler = routes.get(path)
         if handler:
@@ -463,9 +716,10 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _index(self):
         body = (
             "<html><head><title>Movistar IPTV Relay</title></head><body>"
-            "<h2>Movistar IPTV Relay</h2>"
+            "<h2>Movistar IPTV Relay v1.0.5</h2>"
             "<p>Uso: <code>/udp/239.x.x.x:8208/</code></p>"
             "<p><a href='/channels'>Canales</a> | "
+            "<a href='/guide.xml'>EPG (XMLTV)</a> | "
             "<a href='/status'>Estado</a></p>"
             "</body></html>"
         )
@@ -483,6 +737,36 @@ class RelayHandler(BaseHTTPRequestHandler):
         out = {"data": {"channels": {str(k): v for k, v in channels.items()}}}
         self._respond(200, json.dumps(out, ensure_ascii=False, indent=2),
                       "application/json")
+
+    def _guide(self):
+        xmltv = self.state.get_xmltv()
+        if not xmltv:
+            self.send_error(503, "EPG not available yet")
+            return
+        ae = self.headers.get("Accept-Encoding", "")
+        if "gzip" in ae:
+            body = self.state.get_xmltv_gz()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml; charset=utf-8")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self._respond(200, xmltv, "application/xml; charset=utf-8")
+
+    def _guide_gz(self):
+        gz = self.state.get_xmltv_gz()
+        if not gz:
+            self.send_error(503, "EPG not available yet")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Content-Length", str(len(gz)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(gz)
 
     def _relay(self, addr, port):
         key = f"{addr}:{port}"
@@ -569,24 +853,70 @@ class DiscoveryThread(threading.Thread):
         self.state = state
         self.iptv_ip = iptv_ip
         self.interval = interval
+        self._epg_thread = None
 
     def run(self):
         while True:
             try:
-                channels = discover_channels(self.iptv_ip)
-                if channels:
-                    self.state.set_channels(channels)
-                    try:
-                        with open("/data/channels_cache.json", "w") as f:
-                            json.dump(
-                                {str(k): v for k, v in channels.items()},
-                                f, ensure_ascii=False)
-                    except Exception:
-                        pass
+                channels, segments, endpoint = discover_channels(self.iptv_ip)
+                if not channels:
+                    print("[discovery] No channels found", flush=True)
+                    time.sleep(self.interval)
+                    continue
+                self.state.set_channels(channels)
+                try:
+                    with open("/data/channels_cache.json", "w") as f:
+                        json.dump(
+                            {str(k): v for k, v in channels.items()},
+                            f, ensure_ascii=False)
+                except Exception:
+                    pass
+
+                if self._epg_thread is None or not self._epg_thread.is_alive():
+                    self._epg_thread = EPGThread(
+                        self.state, self.iptv_ip, channels, segments, endpoint)
+                    self._epg_thread.start()
+
             except Exception as e:
                 print(f"[discovery] Error: {e}", flush=True)
 
             time.sleep(self.interval)
+
+
+class EPGThread(threading.Thread):
+    def __init__(self, state, iptv_ip, channels, segments, endpoint):
+        super().__init__(daemon=True, name="epg")
+        self.state = state
+        self.iptv_ip = iptv_ip
+        self.channels = channels
+        self.segments = segments
+        self.endpoint = endpoint
+
+    def run(self):
+        try:
+            epg = {}
+            if self.segments:
+                print(f"[epg] Downloading binary EPG ({len(self.segments)} segments)...",
+                      flush=True)
+                epg = download_epg_binary(self.segments, self.iptv_ip, self.channels)
+
+            if len(epg) < len(self.channels) // 2 and self.endpoint:
+                print(f"[epg] Binary EPG covers {len(epg)}/{len(self.channels)} channels, "
+                      f"fetching rest from API...", flush=True)
+                api_epg = download_epg_from_api(self.endpoint, self.channels)
+                for ch_id, progs in api_epg.items():
+                    if ch_id not in epg:
+                        epg[ch_id] = progs
+                    else:
+                        epg[ch_id].update(progs)
+
+            if epg:
+                self.state.set_epg(epg, self.channels)
+            else:
+                print("[epg] No EPG data obtained", flush=True)
+
+        except Exception as e:
+            print(f"[epg] Error: {e}", flush=True)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -647,12 +977,22 @@ def main():
 
     state = RelayState()
 
-    # Load cached channels if available
+    # Load cached channels and EPG if available
     try:
         with open("/data/channels_cache.json") as f:
             cached = json.load(f)
-        state.set_channels({int(k): v for k, v in cached.items()})
+        channels_cache = {int(k): v for k, v in cached.items()}
+        state.set_channels(channels_cache)
         print(f"[relay] Loaded {len(cached)} cached channels", flush=True)
+        try:
+            with open("/data/epg_cache.json") as f:
+                epg_cached = json.load(f)
+            epg_data = {int(k): v for k, v in epg_cached.items()}
+            if epg_data:
+                state.set_epg(epg_data, channels_cache)
+                print(f"[relay] Loaded cached EPG: {len(epg_data)} channels", flush=True)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -668,12 +1008,13 @@ def main():
 
     server = ThreadedHTTPServer(("0.0.0.0", args.port), RelayHandler)
 
-    print(f"[relay] Movistar IPTV Relay v1.0.3", flush=True)
+    print(f"[relay] Movistar IPTV Relay v1.0.5", flush=True)
     print(f"[relay] Listening on 0.0.0.0:{args.port}", flush=True)
     print(f"[relay] Multicast interface: {iface}", flush=True)
     print(f"[relay] Endpoints:", flush=True)
     print(f"[relay]   /udp/239.x.x.x:8208/  Stream", flush=True)
     print(f"[relay]   /channels              Channel list", flush=True)
+    print(f"[relay]   /guide.xml             EPG (XMLTV)", flush=True)
     print(f"[relay]   /status                Status", flush=True)
 
     try:
