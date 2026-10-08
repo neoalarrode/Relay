@@ -676,7 +676,7 @@ def check_scrambling(data):
                 scrambled += 1
         offset += TS_SIZE
 
-    return (True, scrambled > 0) if total > 0 else (True, False)
+    return (True, scrambled > total * 0.5) if total > 0 else (True, False)
 
 
 def scan_channel(addr, port, iptv_ip, timeout=1.5, attempts=8):
