@@ -51,7 +51,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.2.1"
+__version__ = "2.3.0"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -680,65 +680,119 @@ def _extract_pusi_payload(data, target_pid):
     return b""
 
 
+def _tsc_ratio(data, target_pid):
+    offset = find_ts_offset(data)
+    if offset < 0:
+        return 0, 0
+    total = 0
+    scrambled = 0
+    while offset + TS_SIZE <= len(data):
+        if data[offset] != TS_SYNC:
+            offset += 1
+            continue
+        pid = ((data[offset + 1] & 0x1F) << 8) | data[offset + 2]
+        if pid == target_pid:
+            total += 1
+            if (data[offset + 3] >> 6) & 0x03:
+                scrambled += 1
+        offset += TS_SIZE
+    return scrambled, total
+
+
+def _dominant_pid(data):
+    offset = find_ts_offset(data)
+    if offset < 0:
+        return None
+    counts = {}
+    while offset + TS_SIZE <= len(data):
+        if data[offset] != TS_SYNC:
+            offset += 1
+            continue
+        pid = ((data[offset + 1] & 0x1F) << 8) | data[offset + 2]
+        if pid not in SI_PIDS:
+            counts[pid] = counts.get(pid, 0) + 1
+        offset += TS_SIZE
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+
 def check_scrambling(data):
     offset = find_ts_offset(data)
     if offset < 0:
         return False, False, 0, 0
 
+    # --- Parse PAT to find PMT PID ---
     pat = _extract_pusi_payload(data, 0)
-    if len(pat) < 12:
-        return True, True, -1, 0
-    ptr = pat[0]
-    pos = 1 + ptr
-    if pos + 8 > len(pat) or pat[pos] != 0x00:
-        return True, True, -1, 0
-    section_len = ((pat[pos + 1] & 0x0F) << 8) | pat[pos + 2]
-    pos += 8
     pmt_pid = None
-    end = min(pos + section_len - 9, len(pat) - 4)
-    while pos + 4 <= end:
-        prog_num = (pat[pos] << 8) | pat[pos + 1]
-        pid = ((pat[pos + 2] & 0x1F) << 8) | pat[pos + 3]
-        if prog_num != 0:
-            pmt_pid = pid
-            break
-        pos += 4
-    if pmt_pid is None:
-        return True, True, -1, 0
-
-    pmt = _extract_pusi_payload(data, pmt_pid)
-    if len(pmt) < 16:
-        return True, True, -2, 0
-    ptr = pmt[0]
-    pos = 1 + ptr
-    if pos + 12 > len(pmt) or pmt[pos] != 0x02:
-        return True, True, -2, 0
-    section_len = ((pmt[pos + 1] & 0x0F) << 8) | pmt[pos + 2]
-    prog_info_len = ((pmt[pos + 10] & 0x0F) << 8) | pmt[pos + 11]
-
+    video_pid = None
     ca_count = 0
-    i = pos + 12
-    desc_end = i + prog_info_len
-    while i + 2 <= desc_end and i < len(pmt):
-        tag, dlen = pmt[i], pmt[i + 1]
-        if tag == 0x09:
-            ca_count += 1
-        i += 2 + dlen
 
-    es_pos = desc_end
-    section_end = pos + 3 + section_len - 4
-    while es_pos + 5 <= section_end and es_pos + 5 <= len(pmt):
-        es_info_len = ((pmt[es_pos + 3] & 0x0F) << 8) | pmt[es_pos + 4]
-        i = es_pos + 5
-        es_desc_end = i + es_info_len
-        while i + 2 <= es_desc_end and i < len(pmt):
-            tag, dlen = pmt[i], pmt[i + 1]
-            if tag == 0x09:
-                ca_count += 1
-            i += 2 + dlen
-        es_pos = es_desc_end
+    if len(pat) >= 12:
+        ptr = pat[0]
+        pos = 1 + ptr
+        if pos + 8 <= len(pat) and pat[pos] == 0x00:
+            section_len = ((pat[pos + 1] & 0x0F) << 8) | pat[pos + 2]
+            pos += 8
+            end = min(pos + section_len - 9, len(pat) - 4)
+            while pos + 4 <= end:
+                prog_num = (pat[pos] << 8) | pat[pos + 1]
+                pid = ((pat[pos + 2] & 0x1F) << 8) | pat[pos + 3]
+                if prog_num != 0:
+                    pmt_pid = pid
+                    break
+                pos += 4
 
-    return True, ca_count > 0, ca_count, 0
+    # --- Parse PMT for CA_descriptor and video PID ---
+    if pmt_pid is not None:
+        pmt = _extract_pusi_payload(data, pmt_pid)
+        if len(pmt) >= 16:
+            ptr = pmt[0]
+            pos = 1 + ptr
+            if pos + 12 <= len(pmt) and pmt[pos] == 0x02:
+                section_len = ((pmt[pos + 1] & 0x0F) << 8) | pmt[pos + 2]
+                prog_info_len = ((pmt[pos + 10] & 0x0F) << 8) | pmt[pos + 11]
+
+                i = pos + 12
+                desc_end = i + prog_info_len
+                while i + 2 <= desc_end and i < len(pmt):
+                    tag, dlen = pmt[i], pmt[i + 1]
+                    if tag == 0x09:
+                        ca_count += 1
+                    i += 2 + dlen
+
+                es_pos = desc_end
+                section_end = pos + 3 + section_len - 4
+                while es_pos + 5 <= section_end and es_pos + 5 <= len(pmt):
+                    stype = pmt[es_pos]
+                    es_pid = ((pmt[es_pos + 1] & 0x1F) << 8) | pmt[es_pos + 2]
+                    es_info_len = ((pmt[es_pos + 3] & 0x0F) << 8) | pmt[es_pos + 4]
+                    if video_pid is None and stype in (0x02, 0x1B, 0x24, 0x25):
+                        video_pid = es_pid
+                    i = es_pos + 5
+                    es_desc_end = i + es_info_len
+                    while i + 2 <= es_desc_end and i < len(pmt):
+                        tag, dlen = pmt[i], pmt[i + 1]
+                        if tag == 0x09:
+                            ca_count += 1
+                        i += 2 + dlen
+                    es_pos = es_desc_end
+
+                if ca_count == 0:
+                    return True, False, 0, 0
+
+    # --- TSC check: CA_descriptor present or no PMT available ---
+    check_pid = video_pid or _dominant_pid(data)
+    if check_pid is None:
+        return True, ca_count > 0, ca_count, 0
+
+    scrambled, total = _tsc_ratio(data, check_pid)
+    if total == 0:
+        return True, ca_count > 0, ca_count, 0
+
+    pct = scrambled * 100 // total
+    encrypted = pct > 50
+    return True, encrypted, ca_count, pct
 
 
 def scan_channel(addr, port, iptv_ip, timeout=1.5, attempts=8):
@@ -1633,7 +1687,7 @@ Proxy endpoints:
                 offline.append((ch_id, ch))
 
             if st == "encrypted" or st == "error":
-                log.info("  %s: %s (CA_desc=%d, %dB)", st, name, n_scr, n_bytes)
+                log.info("  %s: %s (CA_desc=%d, TSC=%d%%, %dB)", st, name, n_scr, n_total, n_bytes)
 
             if i % 50 == 0 and args.serve:
                 state.update_scan(free, encrypted, offline)
