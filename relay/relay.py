@@ -320,70 +320,111 @@ def parse_segments_xml(xml_str):
     return segments
 
 
-_epg_xml_debug = False
+_EPG_XOR = 0x15
 
-def parse_epg_xml(xml_str, channels):
-    global _epg_xml_debug
+
+def _xor_decode(raw):
+    return bytes([b ^ _EPG_XOR for b in raw])
+
+
+def parse_epg_binary_data(latin1_str, channels):
     programs = defaultdict(dict)
     try:
-        root = fromstring(xml_str.replace("\n", " "))
-    except Exception:
+        raw = latin1_str.encode("latin1")
+    except (UnicodeEncodeError, AttributeError):
         return programs
 
-    if not _epg_xml_debug:
-        _epg_xml_debug = True
-        tags = set()
-        for el in root.iter():
-            tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
-            tags.add(tag)
-            if len(tags) > 30:
-                break
-        print(f"[epg] DEBUG XML root={root.tag} element_tags={sorted(tags)}", flush=True)
-        if len(list(root)) > 0:
-            first = list(root)[0]
-            print(f"[epg] DEBUG first child: tag={first.tag} attribs={dict(first.attrib)}", flush=True)
+    ch_match = re.search(rb"(\d+)\.imagenio\.es", raw)
+    if not ch_match:
+        return programs
+    try:
+        ch_id = int(ch_match.group(1))
+    except ValueError:
+        return programs
+    if ch_id not in channels:
+        return programs
 
-    for event in root.iter("event"):
-        try:
-            ch_id = int(event.attrib.get("channel_id",
-                        event.attrib.get("serviceUID", 0)))
-            if ch_id == 0:
-                continue
-            begin = int(event.attrib.get("beginTime",
-                        event.attrib.get("begin_time", 0)))
-            if begin > 1e12:
-                begin //= 1000
-            duration = int(event.attrib.get("duration", 0))
-            if duration > 1e6:
-                duration //= 1000
-            title = event.attrib.get("name", event.attrib.get("title", ""))
-            try:
-                title = title.encode("latin1").decode("utf8")
-            except (UnicodeDecodeError, UnicodeEncodeError, AttributeError):
-                pass
-            title = re.sub(r"(\d+)/(\d+)", r"\1\2", title).strip()
-
-            genre = event.attrib.get("genre", event.attrib.get("labelGenre", ""))
-            genre_id = event.attrib.get("genreID", event.attrib.get("themeID", ""))
-
-            serie = ""
-            season = episode = 0
-            m = re.search(r"^(.+?) S(\d+)E(\d+)", title)
-            if m:
-                serie, season, episode = m.group(1), int(m.group(2)), int(m.group(3))
-
-            programs[ch_id][begin] = {
-                "pid": int(event.attrib.get("extInfoID",
-                           event.attrib.get("pid", event.attrib.get("id", 0)))),
-                "duration": duration,
-                "full_title": title,
-                "genre": genre_id or genre,
-                "serie": serie,
-                "season": season,
-                "episode": episode,
-            }
-        except (KeyError, ValueError):
+    data = raw[ch_match.end():]
+    pos = 0
+    while pos < len(data) - 10:
+        if data[pos] not in (0xDA, 0xDB):
+            pos += 1
             continue
+
+        if pos + 9 > len(data):
+            break
+        event_id = struct.unpack(">H", data[pos + 1:pos + 3])[0]
+        begin = struct.unpack(">I", data[pos + 3:pos + 7])[0]
+        duration = struct.unpack(">H", data[pos + 7:pos + 9])[0]
+
+        if not (1700000000 < begin < 1900000000) or duration > 86400:
+            pos += 1
+            continue
+
+        f1 = data.find(0xF1, pos + 15)
+        if f1 == -1 or f1 - pos > 500:
+            pos += 1
+            continue
+
+        title = ""
+        genre_val = ""
+        scan = pos + 15
+        while scan < f1 - 2:
+            tag = data[scan]
+            if scan + 3 > len(data):
+                break
+            tlen = struct.unpack(">H", data[scan + 1:scan + 3])[0]
+            if tlen > 400 or scan + 3 + tlen > len(data):
+                scan += 1
+                continue
+            val = data[scan + 3:scan + 3 + tlen]
+            if tag == 0x54 and tlen >= 2:
+                genre_val = f"{val[-1]:02x}"
+            elif tag == 0x4D and tlen >= 5:
+                title_len = val[3]
+                if title_len <= tlen - 4:
+                    title_raw = val[4:4 + title_len]
+                    try:
+                        title = _xor_decode(title_raw).decode("utf-8", errors="replace")
+                    except Exception:
+                        title = ""
+            scan += 3 + tlen
+            if tag in (0x54, 0x55, 0x4D):
+                continue
+            break
+
+        if not title:
+            pos = f1 + 1
+            continue
+
+        title = title.strip()
+        serie = ""
+        season = episode = 0
+        m = re.search(r"^(.+?) S(\d+)E(\d+)", title)
+        if m:
+            serie, season, episode = m.group(1), int(m.group(2)), int(m.group(3))
+        ep_m = re.search(r"(.+?) (?:Ep\.|T\d+\s*Ep\.?)\s*(\d+)", title)
+        if ep_m and not serie:
+            serie = ep_m.group(1).strip()
+            episode = int(ep_m.group(2))
+
+        programs[ch_id][begin] = {
+            "pid": event_id,
+            "duration": duration,
+            "full_title": title,
+            "genre": genre_val,
+            "serie": serie,
+            "season": season,
+            "episode": episode,
+        }
+
+        f3 = data.find(0xF3, f1)
+        if f3 != -1:
+            stover = data.find(b"STOVER", f3)
+            pos = (stover + 6) if stover != -1 and stover - f3 < 30 else f3 + 1
+        else:
+            pos = f1 + 1
+
     return programs
 
 
@@ -398,62 +439,36 @@ def download_epg_binary(segments, iptv_ip, channels, timeout_per_day=45):
         day_num = int(day_match.group(1)) if day_match else -1
         print(f"[epg] Downloading EPG day {day_num} from {addr}:{port}...", flush=True)
 
-        if day_num == 0 and not total_programs:
+        dvb_files = download_dvb_xml(addr, port, iptv_ip, timeout=timeout_per_day)
+        day_programs = 0
+        for fname, data_str in dvb_files.items():
             try:
-                sock_diag, mreq_diag = multicast_join(addr, port, iptv_ip, timeout=5)
-                raw = sock_diag.recv(65535)
-                print(f"[EPG-DIAG] raw packet len={len(raw)} "
-                      f"hex={raw[:40].hex()} ascii={raw[:40]}", flush=True)
-                try:
-                    sock_diag.setsockopt(socket.IPPROTO_IP,
-                                         socket.IP_DROP_MEMBERSHIP, mreq_diag)
-                except OSError:
-                    pass
-                sock_diag.close()
-            except Exception as e:
-                print(f"[EPG-DIAG] raw capture failed: {e}", flush=True)
-
-        xml_files = download_dvb_xml(addr, port, iptv_ip, timeout=timeout_per_day)
-        print(f"[EPG-DIAG] day {day_num}: {len(xml_files)} carousel files "
-              f"keys={list(xml_files.keys())}", flush=True)
-        for fname, xml_str in xml_files.items():
-            if not total_programs:
-                preview = xml_str[:500].replace("\n", " ")
-                print(f"[EPG-DIAG] file {fname} preview: {preview}", flush=True)
-            try:
-                programs = parse_epg_xml(xml_str, channels)
+                programs = parse_epg_binary_data(data_str, channels)
                 for ch_id, progs in programs.items():
                     epg[ch_id].update(progs)
+                    day_programs += len(progs)
                     total_programs += len(progs)
             except Exception as e:
                 print(f"[epg] Parse error {source}/{fname}: {e}", flush=True)
+        print(f"[epg] Day {day_num}: {len(dvb_files)} files, "
+              f"{day_programs} programs", flush=True)
 
-    print(f"[epg] Binary: {total_programs} programs across {len(epg)} channels", flush=True)
+    print(f"[epg] Binary EPG: {total_programs} programs across "
+          f"{len(epg)} channels", flush=True)
     return dict(epg)
 
 
 def download_epg_from_api(endpoint, channels):
     epg = defaultdict(dict)
     total = 0
-    first_ch = next(iter(channels))
-
-    try:
-        url = f"{endpoint}?action=getEpg&channelID={first_ch}&first=0&numItems=5"
-        raw_resp = http_get(url)
-        print(f"[EPG-DIAG] API raw URL: {url}", flush=True)
-        print(f"[EPG-DIAG] API raw response ({len(raw_resp)} chars): "
-              f"{raw_resp[:500]}", flush=True)
-    except Exception as e:
-        print(f"[EPG-DIAG] API raw test failed: {e}", flush=True)
-
     errors = 0
     for ch_id in channels:
         try:
             data = api_call(endpoint, f"getEpg&channelID={ch_id}&first=0&numItems=200")
             if not data:
                 errors += 1
-                if errors <= 3:
-                    print(f"[EPG-DIAG] API ch {ch_id}: resultData is empty/None", flush=True)
+                if errors >= 10:
+                    break
                 continue
             items = data if isinstance(data, list) else data.get("items", data.get("epg", []))
             if not isinstance(items, list):
@@ -702,7 +717,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.6",
+                "version": "1.0.7",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
@@ -766,7 +781,7 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _index(self):
         body = (
             "<html><head><title>Movistar IPTV Relay</title></head><body>"
-            "<h2>Movistar IPTV Relay v1.0.6</h2>"
+            "<h2>Movistar IPTV Relay v1.0.7</h2>"
             "<p>Uso: <code>/udp/239.x.x.x:8208/</code></p>"
             "<p><a href='/channels'>Canales</a> | "
             "<a href='/guide.xml'>EPG (XMLTV)</a> | "
@@ -1058,7 +1073,7 @@ def main():
 
     server = ThreadedHTTPServer(("0.0.0.0", args.port), RelayHandler)
 
-    print(f"[relay] Movistar IPTV Relay v1.0.6", flush=True)
+    print(f"[relay] Movistar IPTV Relay v1.0.7", flush=True)
     print(f"[relay] Listening on 0.0.0.0:{args.port}", flush=True)
     print(f"[relay] Multicast interface: {iface}", flush=True)
     print(f"[relay] Endpoints:", flush=True)
