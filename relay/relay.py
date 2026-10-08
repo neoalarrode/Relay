@@ -812,7 +812,8 @@ class RelayState:
                 if len(self._logo_cache) < 1000:
                     self._logo_cache[filename] = (data, ctype)
             return (data, ctype)
-        except Exception:
+        except Exception as e:
+            print(f"[logo] Failed to fetch {url}: {e}", flush=True)
             return None
 
     def connect(self, key, client):
@@ -858,6 +859,8 @@ class RelayState:
                 "active_channels": list(self.active.keys()),
                 "total_served": self.total_served,
                 "bytes_relayed_mb": round(mb, 1),
+                "logo_base": self.logo_base,
+                "logo_cached": len(self._logo_cache),
             }
 
 
