@@ -398,13 +398,28 @@ def download_epg_binary(segments, iptv_ip, channels, timeout_per_day=45):
         day_num = int(day_match.group(1)) if day_match else -1
         print(f"[epg] Downloading EPG day {day_num} from {addr}:{port}...", flush=True)
 
+        if day_num == 0 and not total_programs:
+            try:
+                sock_diag, mreq_diag = multicast_join(addr, port, iptv_ip, timeout=5)
+                raw = sock_diag.recv(65535)
+                print(f"[EPG-DIAG] raw packet len={len(raw)} "
+                      f"hex={raw[:40].hex()} ascii={raw[:40]}", flush=True)
+                try:
+                    sock_diag.setsockopt(socket.IPPROTO_IP,
+                                         socket.IP_DROP_MEMBERSHIP, mreq_diag)
+                except OSError:
+                    pass
+                sock_diag.close()
+            except Exception as e:
+                print(f"[EPG-DIAG] raw capture failed: {e}", flush=True)
+
         xml_files = download_dvb_xml(addr, port, iptv_ip, timeout=timeout_per_day)
-        print(f"[epg] Day {day_num}: {len(xml_files)} files downloaded "
-              f"({', '.join(f'{k}={len(v)}b' for k, v in xml_files.items())})", flush=True)
+        print(f"[EPG-DIAG] day {day_num}: {len(xml_files)} carousel files "
+              f"keys={list(xml_files.keys())}", flush=True)
         for fname, xml_str in xml_files.items():
-            if day_num == 0 and not total_programs:
+            if not total_programs:
                 preview = xml_str[:500].replace("\n", " ")
-                print(f"[epg] DEBUG file {fname} preview: {preview}", flush=True)
+                print(f"[EPG-DIAG] file {fname} preview: {preview}", flush=True)
             try:
                 programs = parse_epg_xml(xml_str, channels)
                 for ch_id, progs in programs.items():
@@ -420,16 +435,25 @@ def download_epg_binary(segments, iptv_ip, channels, timeout_per_day=45):
 def download_epg_from_api(endpoint, channels):
     epg = defaultdict(dict)
     total = 0
+    first_ch = next(iter(channels))
 
-    debug_logged = False
+    try:
+        url = f"{endpoint}?action=getEpg&channelID={first_ch}&first=0&numItems=5"
+        raw_resp = http_get(url)
+        print(f"[EPG-DIAG] API raw URL: {url}", flush=True)
+        print(f"[EPG-DIAG] API raw response ({len(raw_resp)} chars): "
+              f"{raw_resp[:500]}", flush=True)
+    except Exception as e:
+        print(f"[EPG-DIAG] API raw test failed: {e}", flush=True)
+
+    errors = 0
     for ch_id in channels:
         try:
             data = api_call(endpoint, f"getEpg&channelID={ch_id}&first=0&numItems=200")
-            if not debug_logged:
-                print(f"[epg] DEBUG API ch {ch_id} raw response type={type(data).__name__} "
-                      f"preview={str(data)[:300]}", flush=True)
-                debug_logged = True
             if not data:
+                errors += 1
+                if errors <= 3:
+                    print(f"[EPG-DIAG] API ch {ch_id}: resultData is empty/None", flush=True)
                 continue
             items = data if isinstance(data, list) else data.get("items", data.get("epg", []))
             if not isinstance(items, list):
@@ -678,7 +702,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.5",
+                "version": "1.0.6",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
@@ -742,7 +766,7 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _index(self):
         body = (
             "<html><head><title>Movistar IPTV Relay</title></head><body>"
-            "<h2>Movistar IPTV Relay v1.0.5</h2>"
+            "<h2>Movistar IPTV Relay v1.0.6</h2>"
             "<p>Uso: <code>/udp/239.x.x.x:8208/</code></p>"
             "<p><a href='/channels'>Canales</a> | "
             "<a href='/guide.xml'>EPG (XMLTV)</a> | "
@@ -1034,7 +1058,7 @@ def main():
 
     server = ThreadedHTTPServer(("0.0.0.0", args.port), RelayHandler)
 
-    print(f"[relay] Movistar IPTV Relay v1.0.5", flush=True)
+    print(f"[relay] Movistar IPTV Relay v1.0.6", flush=True)
     print(f"[relay] Listening on 0.0.0.0:{args.port}", flush=True)
     print(f"[relay] Multicast interface: {iface}", flush=True)
     print(f"[relay] Endpoints:", flush=True)
