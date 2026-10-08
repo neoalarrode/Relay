@@ -43,10 +43,13 @@ END_POINTS = (
     "http://reg360.imagenio.telefonica.net:2070",
 )
 
-LOGO_DEFAULTS = {
-    "res_base": f"http://{IPTV_RES_HOST}/appclientv/nux/",
-    "logo_path": "incoming/epg/channelLogo/",
-}
+LOGO_PATH = "incoming/epg/channelLogo/"
+LOGO_BASES = [
+    "http://html5-static.svc.imagenio.telefonica.net/appclientv/nux/",
+    f"http://{IPTV_RES_HOST}/appclientv/nux/",
+    f"http://{IPTV_RES_HOST}:2001/appclientv/nux/",
+    "http://172.26.22.23:8080/appclientv/nux/",
+]
 
 GENRE_MAP = {
     "0": "Otros", "1": "Cine", "2": "Noticias", "3": "Entretenimiento",
@@ -646,23 +649,45 @@ def generate_xmltv(channels, epg):
 
 
 def get_logo_base_url(endpoint):
-    logo_path = LOGO_DEFAULTS["logo_path"]
+    logo_path = LOGO_PATH
     try:
-        platform = api_call(endpoint, "getPlatformProfile")
         config = api_call(endpoint, "getConfigurationParams")
         if config:
             logo_path = config.get("tvChannelLogoPath", logo_path)
+        platform = api_call(endpoint, "getPlatformProfile")
         if platform:
-            res_base = platform.get("RES_BASE_URI") or platform.get("res_BASE_URI", "")
-            if res_base:
-                base = res_base.rstrip("/") + "/" + logo_path
-                print(f"[discovery] Logo base from API: {base}", flush=True)
-                return base
+            api_base = platform.get("RES_BASE_URI") or platform.get("res_BASE_URI", "")
+            if api_base:
+                from urllib.parse import urlparse
+                parsed = urlparse(api_base)
+                candidates = [api_base.rstrip("/") + "/" + logo_path]
+                for lb in LOGO_BASES:
+                    c = lb.rstrip("/") + "/" + logo_path
+                    if c not in candidates:
+                        candidates.append(c)
+                if parsed.hostname and parsed.hostname not in api_base:
+                    candidates.insert(0, api_base.rstrip("/") + "/" + logo_path)
+            else:
+                candidates = [lb.rstrip("/") + "/" + logo_path for lb in LOGO_BASES]
+        else:
+            candidates = [lb.rstrip("/") + "/" + logo_path for lb in LOGO_BASES]
     except Exception as e:
-        print(f"[discovery] Logo URL fetch error: {e}", flush=True)
-    base = LOGO_DEFAULTS["res_base"] + logo_path
-    print(f"[discovery] Using default logo base: {base}", flush=True)
-    return base
+        print(f"[discovery] Logo config error: {e}", flush=True)
+        candidates = [lb.rstrip("/") + "/" + logo_path for lb in LOGO_BASES]
+
+    for base in candidates:
+        test_url = base + "5338.jpg"
+        try:
+            req = urllib.request.Request(test_url, headers={"User-Agent": UA})
+            resp = urllib.request.urlopen(req, timeout=5)
+            if resp.status == 200 and len(resp.read(1024)) > 0:
+                print(f"[discovery] Logo base OK: {base}", flush=True)
+                return base
+        except Exception as e:
+            print(f"[discovery] Logo base FAIL: {base} ({e})", flush=True)
+
+    print("[discovery] WARNING: No working logo base found", flush=True)
+    return candidates[0] if candidates else LOGO_BASES[0].rstrip("/") + "/" + logo_path
 
 
 def discover_channels(iptv_ip):
@@ -754,7 +779,7 @@ class RelayState:
         self.epg_time = None
         self.xmltv = ""
         self.xmltv_gz = b""
-        self.logo_base = LOGO_DEFAULTS["res_base"] + LOGO_DEFAULTS["logo_path"]
+        self.logo_base = LOGO_BASES[0].rstrip("/") + "/" + LOGO_PATH
         self._logo_cache = {}
         self._logo_lock = threading.Lock()
 
@@ -840,7 +865,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.11",
+                "version": "1.0.12",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
