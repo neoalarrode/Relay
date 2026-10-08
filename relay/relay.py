@@ -646,25 +646,21 @@ def generate_xmltv(channels, epg):
 
 
 def get_logo_base_url(endpoint):
+    logo_path = LOGO_DEFAULTS["logo_path"]
     try:
         platform = api_call(endpoint, "getPlatformProfile")
         config = api_call(endpoint, "getConfigurationParams")
-        if platform and config:
+        if config:
+            logo_path = config.get("tvChannelLogoPath", logo_path)
+        if platform:
             res_base = platform.get("RES_BASE_URI") or platform.get("res_BASE_URI", "")
-            logo_path = config.get("tvChannelLogoPath", LOGO_DEFAULTS["logo_path"])
             if res_base:
-                try:
-                    from urllib.parse import urlparse, urlunparse
-                    parsed = urlparse(res_base)
-                    resolved = urlunparse(parsed._replace(netloc=IPTV_RES_HOST))
-                    base = resolved.rstrip("/") + "/" + logo_path
-                except Exception:
-                    base = LOGO_DEFAULTS["res_base"] + logo_path
-                print(f"[discovery] Logo base URL: {base}", flush=True)
+                base = res_base.rstrip("/") + "/" + logo_path
+                print(f"[discovery] Logo base from API: {base}", flush=True)
                 return base
     except Exception as e:
         print(f"[discovery] Logo URL fetch error: {e}", flush=True)
-    base = LOGO_DEFAULTS["res_base"] + LOGO_DEFAULTS["logo_path"]
+    base = LOGO_DEFAULTS["res_base"] + logo_path
     print(f"[discovery] Using default logo base: {base}", flush=True)
     return base
 
@@ -844,7 +840,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.10",
+                "version": "1.0.11",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
