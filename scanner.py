@@ -51,7 +51,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.7.3"
+__version__ = "2.7.4"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -172,6 +172,16 @@ def find_endpoint(proxy=None):
 #  DVB Multicast Data Download
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def isolate_multicast(sock):
+    # Linux default delivers every joined group on this port to the socket, mixing channels
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, getattr(socket, "IP_MULTICAST_ALL", 49), 0)
+    except OSError:
+        pass
+
+
 def multicast_join(addr, port, iptv_ip, timeout=5):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -180,6 +190,7 @@ def multicast_join(addr, port, iptv_ip, timeout=5):
     except (AttributeError, OSError):
         pass
     sock.settimeout(timeout)
+    isolate_multicast(sock)
     try:
         sock.bind((addr, port))
     except OSError:
@@ -784,7 +795,8 @@ def scan_channel(addr, port, iptv_ip, timeout=1.5, attempts=8):
         except (AttributeError, OSError):
             pass
         sock.settimeout(timeout)
-        sock.bind(("", port))
+        isolate_multicast(sock)
+        sock.bind((addr, port))
         mreq = struct.pack("4s4s", socket.inet_aton(addr), socket.inet_aton(iptv_ip))
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
@@ -1122,7 +1134,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 pass
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
             sock.settimeout(5)
-            sock.bind(("", port))
+            isolate_multicast(sock)
+            sock.bind((addr, port))
             mreq = struct.pack("4s4s", socket.inet_aton(addr), socket.inet_aton(state.iptv_ip))
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         except OSError as e:
