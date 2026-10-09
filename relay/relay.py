@@ -1048,6 +1048,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache, no-store")
         self.send_header("Connection", "close")
         self.end_headers()
+        self.wfile.flush()
 
         tcp = self.request
         try:
