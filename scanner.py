@@ -51,7 +51,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -1240,6 +1240,7 @@ class BackgroundScanner(threading.Thread):
         for ch_id, ch in sorted(channels.items(), key=lambda x: x[1].get("name", "")):
             if self.udpxy:
                 status, _, _, _ = scan_channel_udpxy(ch["address"], ch["port"], self.udpxy)
+                time.sleep(0.3)
             else:
                 status, _, _, _ = scan_channel(ch["address"], ch["port"], self.iptv_ip)
 
@@ -1249,6 +1250,19 @@ class BackgroundScanner(threading.Thread):
                 encrypted.append((ch_id, ch))
             else:
                 offline.append((ch_id, ch))
+
+        # Verify free channels
+        if self.udpxy and free:
+            verified = []
+            for ch_id, ch in free:
+                time.sleep(0.5)
+                st2, n2, _, _ = scan_channel_udpxy(ch["address"], ch["port"], self.udpxy)
+                if st2 == "encrypted":
+                    encrypted.append((ch_id, ch))
+                    log.info("  VERIFY: %s -> encrypted", ch.get("name", str(ch_id)))
+                else:
+                    verified.append((ch_id, ch))
+            free = verified
 
         old_free = set(self.state.free_channels.keys())
         new_free = {ch_id for ch_id, _ in free}
@@ -1652,6 +1666,7 @@ Proxy endpoints:
 
             if args.udpxy:
                 st, n_scr, n_total, n_bytes = scan_channel_udpxy(ch["address"], ch["port"], args.udpxy)
+                time.sleep(0.3)
             else:
                 st, n_scr, n_total, n_bytes = scan_channel(ch["address"], ch["port"], iptv_ip)
 
@@ -1672,6 +1687,64 @@ Proxy endpoints:
             if i % 50 == 0 and args.serve:
                 state.update_scan(free, encrypted, offline)
                 log.info("Scan progress: %d/%d (%d free)", i, len(channels), len(free))
+
+        log.info("First pass: %d free, %d encrypted, %d offline, %d errors",
+                 len(free), len(encrypted), len(offline), len(errors))
+
+        # ── Verification pass (udpxy): re-scan free channels to catch false-free ─
+        if args.udpxy and free:
+            log.info("Verifying %d free channels...", len(free))
+            verified_free = []
+            reclass_count = 0
+            for ch_id, ch in free:
+                time.sleep(0.5)
+                st2, n2, t2, b2 = scan_channel_udpxy(ch["address"], ch["port"], args.udpxy)
+                if st2 == "encrypted":
+                    encrypted.append((ch_id, ch))
+                    reclass_count += 1
+                    log.info("  VERIFY: %s -> encrypted (CA=%d, TSC=%d%%)",
+                             ch.get("name", str(ch_id)), n2, t2)
+                else:
+                    verified_free.append((ch_id, ch))
+            free = verified_free
+            if reclass_count:
+                log.info("Verification: %d reclassified free->encrypted", reclass_count)
+
+        # ── Multicast group consistency: same address:port must agree ────────────
+        if args.udpxy:
+            free_ids = {cid for cid, _ in free}
+            enc_ids = {cid for cid, _ in encrypted}
+            groups = {}
+            for cid, ch in free + encrypted:
+                key = f"{ch['address']}:{ch['port']}"
+                groups.setdefault(key, []).append((cid, ch))
+
+            fixed = 0
+            for key, members in groups.items():
+                has_free = any(m[0] in free_ids for m in members)
+                has_enc = any(m[0] in enc_ids for m in members)
+                if has_free and has_enc:
+                    time.sleep(1)
+                    addr, port_s = key.rsplit(":", 1)
+                    st3, _, _, _ = scan_channel_udpxy(addr, int(port_s), args.udpxy)
+                    for mid, mch in members:
+                        mname = mch.get("name", str(mid))
+                        if st3 == "free" and mid in enc_ids:
+                            encrypted = [(c, d) for c, d in encrypted if c != mid]
+                            free.append((mid, mch))
+                            enc_ids.discard(mid)
+                            free_ids.add(mid)
+                            fixed += 1
+                            log.info("  GROUP: %s -> free (consistency)", mname)
+                        elif st3 == "encrypted" and mid in free_ids:
+                            free = [(c, d) for c, d in free if c != mid]
+                            encrypted.append((mid, mch))
+                            free_ids.discard(mid)
+                            enc_ids.add(mid)
+                            fixed += 1
+                            log.info("  GROUP: %s -> encrypted (consistency)", mname)
+            if fixed:
+                log.info("Group consistency: %d channels corrected", fixed)
 
         state.update_scan(free, encrypted, offline)
         log.info("Scan complete: %d free, %d encrypted, %d offline, %d errors",
