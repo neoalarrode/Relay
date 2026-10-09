@@ -51,7 +51,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -764,8 +764,10 @@ def check_scrambling(data):
     cat = _has_cat(data)
     scr, tot = _vid_tsc(data)
     pct = scr * 100 // tot if tot else 0
-    encrypted = cat or pct > 0
-    return True, encrypted, -1 if cat else 0, pct
+    if cat or pct > 0:
+        return True, True, -1 if cat else 0, pct
+    # No PMT, no CAT, no TSC — insufficient data to determine
+    return False, False, 0, 0
 
 
 def scan_channel(addr, port, iptv_ip, timeout=1.5, attempts=8):
@@ -807,7 +809,7 @@ def scan_channel(addr, port, iptv_ip, timeout=1.5, attempts=8):
         return "error", 0, 0, 0
 
 
-def scan_channel_udpxy(addr, port, udpxy_url, timeout=3):
+def scan_channel_udpxy(addr, port, udpxy_url, timeout=5):
     try:
         url = f"{udpxy_url.rstrip('/')}/udp/{addr}:{port}/"
         req = urllib.request.Request(url)
