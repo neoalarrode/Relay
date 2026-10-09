@@ -25,6 +25,7 @@ import struct
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from collections import defaultdict
@@ -712,6 +713,52 @@ def generate_xmltv(channels, epg):
     return "\n".join(lines)
 
 
+PUBLIC_CHANNELS_API = (
+    "https://soteroc-pf.cdn.sve.video.telefonicaservices.com/service/contents/webplayer/"
+    "{profile}/contents/channels?mdrm=true&tlsstream=true&demarcation=4&v=11&startover=U7D")
+_LOGO_NAME_NOISE = re.compile(
+    r"\b(hd|uhd|sd|4k|hdr|tv|canal|int|bar|and|ara|ast|cant|rio|nav|can|cat|cyl|clm|"
+    r"ext|eus|gal|mad|mur|val|pv|bal|horeca)\b")
+
+
+def _logo_key(name):
+    s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    s = _LOGO_NAME_NOISE.sub(" ", re.sub(r"\(.*?\)", " ", s))
+    return re.sub(r"[^a-z0-9+]", "", s)
+
+
+def apply_public_logos(channels):
+    # IPTV only has 104x104 JPEGs on black; the public OTT API has transparent PNGs
+    api = []
+    for profile in ("OTT", "IPTV"):
+        try:
+            req = urllib.request.Request(PUBLIC_CHANNELS_API.format(profile=profile),
+                                         headers={"User-Agent": "Mozilla/5.0"})
+            api += json.loads(urllib.request.urlopen(req, timeout=15).read())
+        except Exception as e:
+            print(f"[logo] Public channel API ({profile}) failed: {e}", flush=True)
+    by_uid, by_name = {}, {}
+    for c in api:
+        uri = next((lg.get("uri") for lg in c.get("Logos") or []
+                    if lg.get("id") == "default" and not lg.get("state")), None) or c.get("Logo")
+        if not uri:
+            continue
+        uid = str(c.get("ServiceUid", ""))
+        if uid.isdigit():
+            by_uid.setdefault(int(uid), uri)
+        by_name.setdefault(_logo_key(c.get("Nombre", "")), uri)
+    for ch_id, ch in channels.items():
+        if ch_id in by_uid:
+            by_name.setdefault(_logo_key(ch["name"]), by_uid[ch_id])
+    hits = 0
+    for ch_id, ch in channels.items():
+        uri = by_uid.get(ch_id) or by_name.get(_logo_key(ch["name"]))
+        if uri:
+            ch["logo"] = uri
+            hits += 1
+    print(f"[logo] Transparent logos: {hits}/{len(channels)} channels", flush=True)
+
+
 def get_logo_base_url(endpoint):
     logo_path = LOGO_PATH
     try:
@@ -932,7 +979,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.17",
+                "version": "1.0.18",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
@@ -1171,6 +1218,7 @@ class DiscoveryThread(threading.Thread):
                     print("[discovery] No channels found", flush=True)
                     time.sleep(self.interval)
                     continue
+                apply_public_logos(channels)
                 self.state.set_channels(channels)
                 try:
                     with open("/data/channels_cache.json", "w") as f:
