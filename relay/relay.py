@@ -18,12 +18,14 @@ import argparse
 import gzip
 import io
 import json
+import os
 import re
 import socket
 import struct
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 from datetime import datetime
@@ -103,10 +105,61 @@ def strip_rtp(data):
 
 # ── Movistar DVB metadata discovery ──────────────────────────────────────────
 
+_dns_cache = {}
+
+
+def iptv_resolve(host, server=IPTV_DNS, timeout=3):
+    if host in _dns_cache:
+        return _dns_cache[host]
+    qid = int.from_bytes(os.urandom(2), "big")
+    qname = b"".join(bytes([len(p)]) + p.encode() for p in host.split(".")) + b"\0"
+    query = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", 1, 1)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(timeout)
+        s.sendto(query, (server, 53))
+        data = s.recv(1500)
+    if struct.unpack(">H", data[:2])[0] != qid:
+        return None
+    ancount = struct.unpack(">H", data[6:8])[0]
+    pos = 12 + len(qname) + 4
+    for _ in range(ancount):
+        while True:
+            b = data[pos]
+            if b & 0xC0 == 0xC0:
+                pos += 2
+                break
+            pos += 1 + b
+            if b == 0:
+                break
+        rtype, _, _, rdlen = struct.unpack(">HHIH", data[pos:pos + 10])
+        pos += 10
+        if rtype == 1 and rdlen == 4:
+            ip = socket.inet_ntoa(data[pos:pos + 4])
+            _dns_cache[host] = ip
+            return ip
+        pos += rdlen
+    return None
+
+
+def iptv_request(url, timeout=10):
+    # Movistar resource hosts (e.g. html5-static.svc.imagenio...) only resolve on the IPTV DNS
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname or ""
+    headers = {"User-Agent": UA}
+    if host.endswith("imagenio.telefonica.net"):
+        try:
+            ip = iptv_resolve(host)
+        except OSError:
+            ip = None
+        if ip:
+            netloc = ip + (f":{parsed.port}" if parsed.port else "")
+            url = urllib.parse.urlunsplit(parsed._replace(netloc=netloc))
+            headers["Host"] = parsed.netloc
+    return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout)
+
+
 def http_get(url, timeout=10):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    resp = urllib.request.urlopen(req, timeout=timeout)
-    return resp.read().decode("utf-8")
+    return iptv_request(url, timeout).read().decode("utf-8")
 
 
 def api_call(endpoint, action):
@@ -689,8 +742,7 @@ def get_logo_base_url(endpoint):
     for base in candidates:
         test_url = base + "5338.jpg"
         try:
-            req = urllib.request.Request(test_url, headers={"User-Agent": UA})
-            resp = urllib.request.urlopen(req, timeout=5)
+            resp = iptv_request(test_url, timeout=5)
             if resp.status == 200 and len(resp.read(1024)) > 0:
                 print(f"[discovery] Logo base OK: {base}", flush=True)
                 return base
@@ -792,6 +844,7 @@ class RelayState:
         self.xmltv_gz = b""
         self.logo_base = LOGO_BASES[0].rstrip("/") + "/" + LOGO_PATH
         self._logo_cache = {}
+        self._logo_failed = {}
         self._logo_lock = threading.Lock()
 
     def set_channels(self, channels):
@@ -834,10 +887,11 @@ class RelayState:
             cached = self._logo_cache.get(filename)
             if cached:
                 return cached
+            if time.time() - self._logo_failed.get(filename, 0) < 600:
+                return None
         url = self.logo_base + filename
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
-            resp = urllib.request.urlopen(req, timeout=10)
+            resp = iptv_request(url, timeout=5)
             data = resp.read()
             ctype = resp.headers.get("Content-Type", "image/jpeg")
             with self._logo_lock:
@@ -845,6 +899,8 @@ class RelayState:
                     self._logo_cache[filename] = (data, ctype)
             return (data, ctype)
         except Exception as e:
+            with self._logo_lock:
+                self._logo_failed[filename] = time.time()
             print(f"[logo] Failed to fetch {url}: {e}", flush=True)
             return None
 
@@ -876,7 +932,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.16",
+                "version": "1.0.17",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
@@ -893,6 +949,7 @@ class RelayState:
                 "bytes_relayed_mb": round(mb, 1),
                 "logo_base": self.logo_base,
                 "logo_cached": len(self._logo_cache),
+                "logo_failed": len(self._logo_failed),
             }
 
 
