@@ -30,6 +30,7 @@ import struct
 import sys
 import time
 import threading
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 from contextlib import closing
@@ -51,7 +52,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.7.4"
+__version__ = "2.8.0"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -1187,48 +1188,42 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _stream_udpxy(self, ch_id, addr, port, name, client):
         state = self.state
-        url = f"{self.udpxy_url.rstrip('/')}/udp/{addr}:{port}/"
-        log.info("[STREAM] %s -> %s via udpxy (%s)", client, name, url)
+        u = urllib.parse.urlsplit(self.udpxy_url)
+        path = f"{u.path.rstrip('/')}/udp/{addr}:{port}/"
+        log.info("[STREAM] %s -> %s via relay %s%s", client, name, u.netloc, path)
 
         try:
-            upstream = urllib.request.urlopen(url, timeout=10)
-        except Exception as e:
-            self.send_error(502, f"udpxy error: {e}")
+            upstream = socket.create_connection((u.hostname, u.port or 80), timeout=10)
+            upstream.sendall(f"GET {path} HTTP/1.0\r\nHost: {u.netloc}\r\n\r\n".encode())
+        except OSError as e:
+            self.send_error(502, f"relay error: {e}")
             return
 
-        state.stream_start(ch_id, client)
-
-        self.send_response(200)
-        self.send_header("Content-Type", "video/MP2T")
-        self.send_header("Cache-Control", "no-cache, no-store")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.flush()
-
+        # Pure byte pipe: relay status line, headers and TS data go to the client untouched
+        self.close_connection = True
         tcp = self.request
         try:
             tcp.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            tcp.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
+            upstream.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         except OSError:
             pass
+        upstream.settimeout(15)
 
+        state.stream_start(ch_id, client)
         total_bytes = 0
         try:
             while True:
-                chunk = upstream.read(65536)
+                chunk = upstream.recv(262144)
                 if not chunk:
                     break
                 tcp.sendall(chunk)
                 total_bytes += len(chunk)
-        except (BrokenPipeError, ConnectionResetError, OSError):
+        except OSError:
             pass
         finally:
             state.stream_stop(ch_id, client)
             log.info("[STREAM] %s -x %s (%d KB)", client, name, total_bytes // 1024)
-            try:
-                upstream.close()
-            except Exception:
-                pass
+            upstream.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
