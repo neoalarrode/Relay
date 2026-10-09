@@ -1028,8 +1028,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             except (AttributeError, OSError):
                 pass
-            rcv_buf = max(self.buffer_kb, 4096) * 1024
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcv_buf)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
             sock.settimeout(10)
             sock.bind(("", port))
             mreq = struct.pack("4s4s",
@@ -1048,36 +1047,27 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "video/MP2T")
         self.send_header("Cache-Control", "no-cache, no-store")
         self.send_header("Connection", "close")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
+        tcp = self.request
         try:
-            self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 0)
+            tcp.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            tcp.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
         except OSError:
             pass
 
         total_bytes = 0
-        flush_threshold = TS_SIZE * 350
         try:
-            buf = bytearray()
             while True:
                 try:
                     data = sock.recv(65535)
                 except socket.timeout:
-                    if buf:
-                        self.wfile.write(buf)
-                        self.wfile.flush()
-                        buf.clear()
                     continue
                 if not data:
                     break
-                ts_payload = strip_rtp(data)
-                buf.extend(ts_payload)
-                if len(buf) >= flush_threshold:
-                    self.wfile.write(buf)
-                    total_bytes += len(buf)
-                    buf.clear()
+                ts = strip_rtp(data)
+                tcp.sendall(ts)
+                total_bytes += len(ts)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
