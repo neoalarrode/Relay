@@ -1028,7 +1028,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             except (AttributeError, OSError):
                 pass
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.buffer_kb * 1024)
+            rcv_buf = max(self.buffer_kb, 4096) * 1024
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcv_buf)
             sock.settimeout(10)
             sock.bind(("", port))
             mreq = struct.pack("4s4s",
@@ -1052,10 +1053,12 @@ class RelayHandler(BaseHTTPRequestHandler):
 
         try:
             self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 0)
         except OSError:
             pass
 
         total_bytes = 0
+        flush_threshold = TS_SIZE * 350
         try:
             buf = bytearray()
             while True:
@@ -1071,9 +1074,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                     break
                 ts_payload = strip_rtp(data)
                 buf.extend(ts_payload)
-                if len(buf) >= TS_SIZE * 49:
+                if len(buf) >= flush_threshold:
                     self.wfile.write(buf)
-                    self.wfile.flush()
                     total_bytes += len(buf)
                     buf.clear()
         except (BrokenPipeError, ConnectionResetError, OSError):
