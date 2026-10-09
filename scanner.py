@@ -51,7 +51,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -757,7 +757,12 @@ def check_scrambling(data):
                     i += 2 + dlen
 
                 if ca_prog > 0:
-                    return True, True, ca_prog, prog_info_len
+                    cat = _has_cat(data)
+                    scr, tot = _vid_tsc(data)
+                    pct = scr * 100 // tot if tot else 0
+                    if cat or pct > 0:
+                        return True, True, ca_prog, pct
+                    return True, False, 0, 0
                 return True, False, 0, 0
 
     # --- Fallback: no PMT → check CAT presence + video TSC ---
