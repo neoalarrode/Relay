@@ -51,7 +51,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.7.2"
+__version__ = "2.7.3"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -1094,6 +1094,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         state = self.state
         with state.lock:
             ch = state.free_channels.get(ch_id)
+            if not ch and ch_id not in state.encrypted_channels:
+                ch = state.all_channels.get(ch_id)
         if not ch:
             self.send_error(404, f"Channel {ch_id} not found or encrypted")
             return
