@@ -51,7 +51,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.7.0"
+__version__ = "2.7.1"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -1175,24 +1175,28 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache, no-store")
         self.send_header("Connection", "close")
         self.end_headers()
+        self.wfile.flush()
 
+        tcp = self.request
         try:
-            self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            tcp.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            tcp.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
         except OSError:
             pass
 
+        total_bytes = 0
         try:
             while True:
-                chunk = upstream.read(TS_SIZE * 49)
+                chunk = upstream.read(65536)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                tcp.sendall(chunk)
+                total_bytes += len(chunk)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
             state.stream_stop(ch_id, client)
-            log.info("[STREAM] %s -x %s", client, name)
+            log.info("[STREAM] %s -x %s (%d KB)", client, name, total_bytes // 1024)
             try:
                 upstream.close()
             except Exception:
