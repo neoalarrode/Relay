@@ -716,15 +716,27 @@ def generate_xmltv(channels, epg):
 PUBLIC_CHANNELS_API = (
     "https://soteroc-pf.cdn.sve.video.telefonicaservices.com/service/contents/webplayer/"
     "{profile}/contents/channels?mdrm=true&tlsstream=true&demarcation=4&v=11&startover=U7D")
+PUBLIC_GUIDE_PAGE = "https://www.movistarplus.es/programacion-tv"
+PUBLIC_LOGO_URL = "https://estatico.emisiondof6.com/recorte/m-DPBLAN/wpmos/{code}"
 _LOGO_NAME_NOISE = re.compile(
-    r"\b(hd|uhd|sd|4k|hdr|tv|canal|int|bar|and|ara|ast|cant|rio|nav|can|cat|cyl|clm|"
+    r"\b(hd|uhd|sd|4k|hdr|pip|tv|canal|int|bar|and|ara|ast|cant|rio|nav|can|cat|cyl|clm|"
     r"ext|eus|gal|mad|mur|val|pv|bal|horeca)\b")
 
 
 def _logo_key(name):
     s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
-    s = _LOGO_NAME_NOISE.sub(" ", re.sub(r"\(.*?\)", " ", s))
+    s = re.sub(r"(?<=\d)(hd|uhd|sd)\b", " ", re.sub(r"\(.*?\)", " ", s))
+    s = _LOGO_NAME_NOISE.sub(" ", s)
     return re.sub(r"[^a-z0-9+]", "", s)
+
+
+def _guide_page_logos():
+    # The public guide lists more channel codes than the API (e.g. Iberalia, EWTN)
+    req = urllib.request.Request(PUBLIC_GUIDE_PAGE, headers={"User-Agent": "Mozilla/5.0"})
+    html = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+    pairs = re.findall(r'<img src="[^"]*/(?:guiamovil|mc1)/([^"/]+)\.png" title="([^"]+)"', html)
+    return {unescape(title): PUBLIC_LOGO_URL.format(code=urllib.parse.quote(urllib.parse.unquote(code), safe=""))
+            for code, title in pairs}
 
 
 def apply_public_logos(channels):
@@ -747,6 +759,11 @@ def apply_public_logos(channels):
         if uid.isdigit():
             by_uid.setdefault(int(uid), uri)
         by_name.setdefault(_logo_key(c.get("Nombre", "")), uri)
+    try:
+        for title, uri in _guide_page_logos().items():
+            by_name.setdefault(_logo_key(title), uri)
+    except Exception as e:
+        print(f"[logo] Public guide page failed: {e}", flush=True)
     for ch_id, ch in channels.items():
         if ch_id in by_uid:
             by_name.setdefault(_logo_key(ch["name"]), by_uid[ch_id])
@@ -979,7 +996,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.18",
+                "version": "1.0.19",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
