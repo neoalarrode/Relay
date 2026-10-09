@@ -34,6 +34,11 @@ from html import unescape
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from xml.etree.ElementTree import fromstring
 
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
 TS_SYNC = 0x47
 TS_SIZE = 188
 IPTV_DNS = "172.26.23.3"
@@ -767,13 +772,37 @@ def apply_public_logos(channels):
     for ch_id, ch in channels.items():
         if ch_id in by_uid:
             by_name.setdefault(_logo_key(ch["name"]), by_uid[ch_id])
-    hits = 0
+    hits = keyed = 0
     for ch_id, ch in channels.items():
         uri = by_uid.get(ch_id) or by_name.get(_logo_key(ch["name"]))
         if uri:
             ch["logo"] = uri
             hits += 1
-    print(f"[logo] Transparent logos: {hits}/{len(channels)} channels", flush=True)
+        elif Image and ch.get("logo", "").endswith(".jpg") and "/" not in ch["logo"]:
+            ch["logo"] = ch["logo"][:-4] + ".png"
+            keyed += 1
+    print(f"[logo] Transparent logos: {hits}/{len(channels)} public, "
+          f"{keyed} from IPTV with black removed", flush=True)
+
+
+def black_to_alpha(jpg):
+    # IPTV logos are drawn on black. Any alpha >= brightness reproduces the original over
+    # black once the colour is un-premultiplied; the sqrt curve keeps dark colours solid.
+    im = Image.open(io.BytesIO(jpg)).convert("RGB")
+    px = im.tobytes()
+    out = bytearray(len(px) // 3 * 4)
+    floor = 24
+    for i in range(len(px) // 3):
+        r, g, b = px[3 * i], px[3 * i + 1], px[3 * i + 2]
+        m = max(r, g, b)
+        if m <= floor:
+            continue
+        a = max(m, int(255 * ((m - floor) / (255 - floor)) ** 0.5))
+        out[4 * i:4 * i + 4] = bytes((min(255, r * 255 // a), min(255, g * 255 // a),
+                                      min(255, b * 255 // a), a))
+    buf = io.BytesIO()
+    Image.frombytes("RGBA", im.size, bytes(out)).save(buf, "PNG", optimize=True)
+    return buf.getvalue()
 
 
 def get_logo_base_url(endpoint):
@@ -953,11 +982,14 @@ class RelayState:
                 return cached
             if time.time() - self._logo_failed.get(filename, 0) < 600:
                 return None
-        url = self.logo_base + filename
+        keyed = filename.endswith(".png") and Image is not None
+        url = self.logo_base + (filename[:-4] + ".jpg" if keyed else filename)
         try:
             resp = iptv_request(url, timeout=5)
             data = resp.read()
             ctype = resp.headers.get("Content-Type", "image/jpeg")
+            if keyed:
+                data, ctype = black_to_alpha(data), "image/png"
             with self._logo_lock:
                 if len(self._logo_cache) < 1000:
                     self._logo_cache[filename] = (data, ctype)
@@ -996,7 +1028,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.19",
+                "version": "1.0.20",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
