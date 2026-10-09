@@ -51,7 +51,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.7.1"
+__version__ = "2.7.2"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -935,6 +935,19 @@ class AppState:
                 if not self.active_streams[ch_id]:
                     del self.active_streams[ch_id]
 
+    def wait_no_streams(self):
+        paused = False
+        while True:
+            with self.lock:
+                if not self.active_streams:
+                    break
+            if not paused:
+                log.info("Scan paused: streams active")
+                paused = True
+            time.sleep(2)
+        if paused:
+            log.info("Scan resumed")
+
     def get_status(self):
         with self.lock:
             uptime = str(datetime.now() - self.start_time).split(".")[0]
@@ -1243,6 +1256,7 @@ class BackgroundScanner(threading.Thread):
 
         for ch_id, ch in sorted(channels.items(), key=lambda x: x[1].get("name", "")):
             if self.udpxy:
+                self.state.wait_no_streams()
                 status, _, _, _ = scan_channel_udpxy(ch["address"], ch["port"], self.udpxy)
                 time.sleep(0.3)
             else:
@@ -1260,6 +1274,7 @@ class BackgroundScanner(threading.Thread):
             verified = []
             for ch_id, ch in free:
                 time.sleep(0.5)
+                self.state.wait_no_streams()
                 st2, n2, _, _ = scan_channel_udpxy(ch["address"], ch["port"], self.udpxy)
                 if st2 == "encrypted":
                     encrypted.append((ch_id, ch))
@@ -1669,6 +1684,7 @@ Proxy endpoints:
                 sys.stdout.flush()
 
             if args.udpxy:
+                state.wait_no_streams()
                 st, n_scr, n_total, n_bytes = scan_channel_udpxy(ch["address"], ch["port"], args.udpxy)
                 time.sleep(0.3)
             else:
@@ -1702,6 +1718,7 @@ Proxy endpoints:
             reclass_count = 0
             for ch_id, ch in free:
                 time.sleep(0.5)
+                state.wait_no_streams()
                 st2, n2, t2, b2 = scan_channel_udpxy(ch["address"], ch["port"], args.udpxy)
                 if st2 == "encrypted":
                     encrypted.append((ch_id, ch))
@@ -1729,6 +1746,7 @@ Proxy endpoints:
                 has_enc = any(m[0] in enc_ids for m in members)
                 if has_free and has_enc:
                     time.sleep(1)
+                    state.wait_no_streams()
                     addr, port_s = key.rsplit(":", 1)
                     st3, _, _, _ = scan_channel_udpxy(addr, int(port_s), args.udpxy)
                     for mid, mch in members:
