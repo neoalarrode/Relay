@@ -871,7 +871,10 @@ class OttThread(threading.Thread):
                     ott_save_cache(progs)
                     index = ott_classify(list(progs.values()))
                     self.state.ott.update(index, len(progs))
-                    self.state.rebuild_xmltv()
+                    try:
+                        self.state.rebuild_xmltv()
+                    except Exception as e:
+                        print(f"[ott] XMLTV rebuild failed: {e}", flush=True)
                     print(f"[ott] {len(progs)} programs over {OTT_KEEP_DAYS} days, "
                           f"{self.state.ott.live} live", flush=True)
                 else:
@@ -1215,9 +1218,9 @@ class RelayState:
 
     def set_epg(self, epg, channels):
         with self.lock:
+            self._store_xmltv(channels, epg)
             self.epg = epg
             self.epg_time = time.time()
-            self._store_xmltv(channels, epg)
             try:
                 with open("/data/epg_cache.json", "w") as f:
                     json.dump({str(k): v for k, v in epg.items()}, f)
@@ -1287,7 +1290,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.22",
+                "version": "1.0.23",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
@@ -1672,7 +1675,8 @@ def main():
         try:
             with open("/data/epg_cache.json") as f:
                 epg_cached = json.load(f)
-            epg_data = {int(k): v for k, v in epg_cached.items()}
+            epg_data = {int(k): {int(ts): p for ts, p in v.items()}
+                        for k, v in epg_cached.items()}
             if epg_data:
                 state.set_epg(epg_data, channels_cache)
                 print(f"[relay] Loaded cached EPG: {len(epg_data)} channels", flush=True)
