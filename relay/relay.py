@@ -20,6 +20,7 @@ import io
 import json
 import os
 import re
+import select
 import socket
 import struct
 import sys
@@ -41,6 +42,8 @@ except ImportError:
 
 TS_SYNC = 0x47
 TS_SIZE = 188
+# Segundos sin datos del grupo multicast tras los que se cierra la conexión y se libera la plaza
+IDLE_TIMEOUT = 30
 IPTV_DNS = "172.26.23.3"
 IPTV_RES_HOST = "172.26.22.23"
 UA = "libcurl-agent/1.0 [IAL] WidgetManager Safari/538.1 CAP:803fd12a 1"
@@ -1028,7 +1031,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.20",
+                "version": "1.0.21",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
@@ -1176,6 +1179,17 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(gz)
 
+    @staticmethod
+    def _client_gone(tcp):
+        """True si el cliente HTTP ya cerró la conexión (lectura devuelve EOF)."""
+        try:
+            readable, _, _ = select.select([tcp], [], [], 0)
+            if readable:
+                return tcp.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
+        return False
+
     def _relay(self, addr, port):
         key = f"{addr}:{port}"
         state = self.state
@@ -1193,7 +1207,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             except (AttributeError, OSError):
                 pass
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-            sock.settimeout(10)
+            sock.settimeout(3)
             isolate_multicast(sock)
             sock.bind((addr, port))
             mreq = struct.pack("4s4s",
@@ -1223,14 +1237,20 @@ class RelayHandler(BaseHTTPRequestHandler):
             pass
 
         total_bytes = 0
+        last_data = time.time()
         try:
             while True:
                 try:
                     data = sock.recv(65535)
                 except socket.timeout:
+                    # Sin tráfico multicast no hay escrituras que delaten un cliente
+                    # caído: se comprueba aquí para no dejar la plaza ocupada.
+                    if self._client_gone(tcp) or time.time() - last_data > IDLE_TIMEOUT:
+                        break
                     continue
                 if not data:
                     break
+                last_data = time.time()
                 ts = strip_rtp(data)
                 tcp.sendall(ts)
                 total_bytes += len(ts)

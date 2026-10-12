@@ -52,7 +52,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.8.0"
+__version__ = "2.8.1"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -1292,6 +1292,14 @@ class BackgroundScanner(threading.Thread):
                 else:
                     verified.append((ch_id, ch))
             free = verified
+
+        # Un escaneo en el que ningún canal da señal (ni libre ni cifrado) indica
+        # que falla la fuente (relay caído o saturado), no que todos hayan caído a
+        # la vez: se conserva el resultado anterior en lugar de vaciar el m3u.
+        if not free and not encrypted and (self.state.free_channels or self.state.encrypted_channels):
+            log.warning("Rescan descartado: %d canales sin señal; se conserva el resultado anterior",
+                        len(offline))
+            return
 
         old_free = set(self.state.free_channels.keys())
         new_free = {ch_id for ch_id, _ in free}
