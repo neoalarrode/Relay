@@ -1173,7 +1173,7 @@ PUBLIC_CHANNELS_API = (
     "https://soteroc-pf.cdn.sve.video.telefonicaservices.com/service/contents/webplayer/"
     "{profile}/contents/channels?mdrm=true&tlsstream=true&demarcation=4&v=11&startover=U7D")
 PUBLIC_GUIDE_PAGE = "https://www.movistarplus.es/programacion-tv"
-PUBLIC_LOGO_URL = "https://estatico.emisiondof6.com/recorte/m-DPBLAN/wpmos/{code}"
+PUBLIC_LOGO_URL = "https://estatico.emisiondof6.com/recorte/m-DP/wpmos/{code}"
 _LOGO_NAME_NOISE = re.compile(
     r"\b(hd|uhd|sd|4k|hdr|pip|tv|canal|int|bar|and|ara|ast|cant|rio|nav|can|cat|cyl|clm|"
     r"ext|eus|gal|mad|mur|val|pv|bal|horeca)\b")
@@ -1207,8 +1207,15 @@ def apply_public_logos(channels):
             print(f"[logo] Public channel API ({profile}) failed: {e}", flush=True)
     by_uid, by_name = {}, {}
     for c in api:
-        uri = next((lg.get("uri") for lg in c.get("Logos") or []
-                    if lg.get("id") == "default" and not lg.get("state")), None) or c.get("Logo")
+        # `m-DP` is the logo drawn for dark backgrounds (white); the catalog's "default"
+        # entry is `m-DPBLAN`, drawn for white backgrounds, i.e. black on transparent
+        # for many channels, which disappears on the dark UI of Emby or Dispatcharr.
+        logos = c.get("Logos") or []
+        uri = (c.get("Logo")
+               or next((lg.get("uri") for lg in logos
+                        if lg.get("id") == "default" and lg.get("state") == "over"), None)
+               or next((lg.get("uri") for lg in logos
+                        if lg.get("id") == "default" and not lg.get("state")), None))
         if not uri:
             continue
         uid = str(c.get("ServiceUid", ""))
@@ -1501,7 +1508,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.24",
+                "version": "1.0.25",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(

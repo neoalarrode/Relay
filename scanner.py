@@ -52,7 +52,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.8.2"
+__version__ = "2.8.3"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -558,26 +558,34 @@ def download_epg_from_api(endpoint, channels, proxy=None):
 # In relay mode the guide is already complete (live/premiere flags, extra categories).
 # Re-serialising it here would drop everything the parser below does not read, so the
 # relay's XMLTV is served as-is and refreshed from the relay periodically.
-RELAY_GUIDE = {"url": None, "xml": None, "fetched": 0.0}
-RELAY_GUIDE_MAX_AGE = 30 * 60
+RELAY_GUIDE = {"url": None, "xml": None, "gz": None, "fetched": 0.0, "thread": False}
+RELAY_GUIDE_REFRESH = 15 * 60
 
 
-def _relay_guide_current():
+def _set_relay_guide(xml):
     g = RELAY_GUIDE
-    if not g["xml"]:
-        return None
-    if time.time() - g["fetched"] > RELAY_GUIDE_MAX_AGE:
+    g["xml"] = xml
+    g["gz"] = gzip.compress(xml.encode("utf-8"))
+    g["fetched"] = time.time()
+
+
+def _relay_guide_loop():
+    # Keeps the served guide current regardless of the rescan interval.
+    while True:
+        time.sleep(RELAY_GUIDE_REFRESH)
         try:
-            with urllib.request.urlopen(g["url"], timeout=30) as resp:
+            with urllib.request.urlopen(RELAY_GUIDE["url"], timeout=60) as resp:
                 xml = resp.read().decode("utf-8")
             if "<programme" not in xml or not xml.rstrip().endswith("</tv>"):
                 raise ValueError("incomplete guide")
-            g["xml"], g["fetched"] = xml, time.time()
+            _set_relay_guide(xml)
             log.info("Relay guide refreshed (%d KB)", len(xml) // 1024)
         except Exception as e:
             log.warning("Relay guide refresh failed, keeping previous: %s", e)
-            g["fetched"] = time.time() - RELAY_GUIDE_MAX_AGE + 300     # retry in 5 min
-    return g["xml"]
+
+
+def _relay_guide_current():
+    return RELAY_GUIDE["xml"]
 
 
 def _write_guide(xml_str, output_path):
@@ -1120,6 +1128,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self._send(json.dumps(self.state.get_status(), indent=2), "application/json")
 
     def _guide(self):
+        if RELAY_GUIDE["xml"]:
+            self._send(RELAY_GUIDE["xml"].encode("utf-8"), "application/xml")
+            return
         path = os.path.join(self.output_dir, "guide.xml")
         if os.path.exists(path):
             with open(path, "rb") as f:
@@ -1128,6 +1139,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404, "EPG not yet available")
 
     def _guide_gz(self):
+        if RELAY_GUIDE["gz"]:
+            self._send(RELAY_GUIDE["gz"], "application/xml", {"Content-Encoding": "gzip"})
+            return
         path = os.path.join(self.output_dir, "guide.xml.gz")
         if os.path.exists(path):
             with open(path, "rb") as f:
@@ -1468,7 +1482,11 @@ def load_metadata_from_relay(udpxy_url):
         resp = urllib.request.urlopen(epg_url, timeout=30)
         xmltv = resp.read().decode("utf-8")
         root = fromstring(xmltv)
-        RELAY_GUIDE.update(url=epg_url, xml=xmltv, fetched=time.time())
+        RELAY_GUIDE["url"] = epg_url
+        _set_relay_guide(xmltv)
+        if not RELAY_GUIDE["thread"]:
+            RELAY_GUIDE["thread"] = True
+            threading.Thread(target=_relay_guide_loop, daemon=True, name="relay-guide").start()
         for prog in root.findall("programme"):
             ch_tag = prog.get("channel", "")
             ch_id = int(ch_tag.split(".")[0]) if "." in ch_tag else 0
