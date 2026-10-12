@@ -30,7 +30,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from html import unescape
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from xml.etree.ElementTree import fromstring
@@ -653,7 +653,236 @@ def _xml_esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
-def generate_xmltv(channels, epg):
+# ── OTT guide enrichment (live / premiere / finer genres) ───────────────────────
+# Movistar's IPTV EPG has no "live" flag, but the OTT guide (the one the Movistar+
+# app and web player use, public and unauthenticated) does: `Directo` per
+# programme, plus `Estreno` and a much finer genre (`GeneroComAntena`). It is joined
+# to the IPTV guide by channel (ServiceUid == IPTV channel id) and start time.
+
+OTT_EPG_URL = ("https://soteroc-pf.cdn.sve.video.telefonicaservices.com/service/contents/"
+               "webplayer/OTT/epg?mdrm=true&demarcation=4&v=11")
+OTT_PAST_DAYS = 7            # past days only feed the recurrence analysis (no `Directo` there)
+OTT_FUTURE_DAYS = 12         # the guide runs ~10 days ahead; stop at the first empty day
+OTT_NEAR_DAYS = 3            # today + 2 are refreshed every cycle, farther days once a day
+OTT_KEEP_DAYS = 15
+OTT_REFRESH = 6 * 3600
+OTT_CACHE = "/data/ott_cache.json"
+OTT_LIVE_GENRES = ("Informativo", "Magacín")
+OTT_NEWS_24H = re.compile(
+    r"24 ?horas|euronews|cnn|bbc news|al jazeera|france ?24|cgtn|\bdw\b|cnbc|sky news|"
+    r"bloomberg|nhk|tv5")
+OTT_NEWS_TITLE = re.compile(r"noticias|informativ|telediario|noticiero|telenoticias")
+
+_SPORTS = ["Sports"]
+GENRE_EN = {
+    "Informativo": ["News"], "Magacín": ["Talk"],
+    "Fútbol": _SPORTS, "Baloncesto": _SPORTS, "Tenis": _SPORTS, "Pádel": _SPORTS,
+    "Golf": _SPORTS, "Ciclismo": _SPORTS, "Motor": _SPORTS, "Motociclismo": _SPORTS,
+    "Fútbol americano": _SPORTS, "Balonmano": _SPORTS, "Hockey patines": _SPORTS,
+    "Hípica": _SPORTS, "Rugby": _SPORTS, "Boxeo": _SPORTS, "Programa deportes": _SPORTS,
+    "Caza y pesca": ["Sports"], "Dibujos animados": ["Children", "Animated"],
+    "Preescolar": ["Children"], "Comedia": ["Comedy"], "Humor": ["Comedy"],
+    "Drama": ["Drama"], "Policíaca": ["Crime"], "Acción": ["Action"],
+    "Thriller": ["Thriller"], "Terror": ["Horror"], "Telerrealidad": ["Reality"],
+    "Entretenimiento": ["Entertainment"], "Naturaleza": ["Nature"],
+    "Historia": ["History"], "Documental": ["Documentary"], "Economía": ["Business"],
+    "Música clásica": ["Music"],
+}
+GENRE_ES_TO_EN = {
+    "Cine": "Movie", "Noticias": "News", "Deportes": "Sports", "Infantil": "Children",
+    "Musica": "Music", "Entretenimiento": "Entertainment", "Educacion": "Educational",
+}
+
+
+def _fold(s):
+    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode()
+    return s.lower()
+
+
+def _ott_flat(o):
+    if isinstance(o, list):
+        for x in o:
+            yield from _ott_flat(x)
+    elif isinstance(o, dict):
+        if "FechaHoraInicio" in o:
+            yield o
+        else:
+            for v in o.values():
+                yield from _ott_flat(v)
+
+
+def ott_fetch_day(day):
+    """One full day (the `from` pivot) -> list of compact programmes, or None on error."""
+    try:
+        req = urllib.request.Request(f"{OTT_EPG_URL}&from={day}",
+                                     headers={"User-Agent": "Mozilla/5.0"})
+        data = json.loads(urllib.request.urlopen(req, timeout=120).read())
+    except Exception as e:
+        print(f"[ott] {day}: {e}", flush=True)
+        return None
+    out, want = [], day.replace("-", "")
+    for p in _ott_flat(data):
+        canal = p.get("Canal") or {}
+        try:
+            uid, start = int(canal.get("ServiceUid")), int(p["FechaHoraInicio"]) // 1000
+        except (TypeError, ValueError):
+            continue
+        if time.strftime("%Y%m%d", time.localtime(start)) != want:
+            continue                       # the response also carries the previous day's tail
+        out.append({
+            "uid": uid, "start": start, "canal": canal.get("Nombre") or "",
+            "titulo": p.get("TituloSerie") or p.get("Titulo") or "",
+            "genero": p.get("GeneroComAntena") or "",
+            "directo": bool(p.get("Directo")), "estreno": bool(p.get("Estreno")),
+            "infantil": bool(p.get("Infantil")),
+        })
+    return out
+
+
+_OTT_FIELDS = ("uid", "start", "canal", "titulo", "genero", "directo", "estreno", "infantil")
+
+
+def ott_load_cache():
+    try:
+        with open(OTT_CACHE) as f:
+            rows = json.load(f)
+        return {(r[0], r[1]): dict(zip(_OTT_FIELDS, r)) for r in rows}
+    except Exception:
+        return {}
+
+
+def ott_save_cache(progs):
+    try:
+        with open(OTT_CACHE, "w") as f:
+            json.dump([[p[k] for k in _OTT_FIELDS] for p in progs.values()], f,
+                      ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        pass
+
+
+def _max_in_week(ordinals):
+    """Largest number of distinct dates that fall inside any 7-day window."""
+    days = sorted(ordinals)
+    best, j = 0, 0
+    for i, d in enumerate(days):
+        while days[j] < d - 6:
+            j += 1
+        best = max(best, i - j + 1)
+    return best
+
+
+def ott_classify(progs):
+    """-> {(uid, start_minute): {live, premiere, genre, kids}}
+
+    Live comes from Movistar's own `Directo` flag (sport events) and, for the rest,
+    from its genre label: a magazine (`Magacín`) is live outside the overnight repeat
+    slot; a news/talk programme (`Informativo`) is live on 24h news channels, when it
+    airs at least 4 days within a week, or when its title says so."""
+    days = defaultdict(set)
+    for p in progs:
+        lt0 = time.localtime(p["start"])
+        days[(p["canal"], p["titulo"])].add(date(lt0.tm_year, lt0.tm_mon, lt0.tm_mday).toordinal())
+    weekly = {k: _max_in_week(v) for k, v in days.items()}
+    out = {}
+    for p in progs:
+        lt = time.localtime(p["start"])
+        hour = lt.tm_hour + lt.tm_min / 60
+        live = p["directo"]
+        if not live and p["genero"] in OTT_LIVE_GENRES:
+            chan_f, title_f = _fold(p["canal"]), _fold(p["titulo"])
+            if OTT_NEWS_24H.search(chan_f):
+                live = True
+            elif not 1.0 <= hour < 5.5:             # overnight slot is repeats
+                live = (p["genero"] == "Magacín"
+                        or weekly[(p["canal"], p["titulo"])] >= 4
+                        or bool(OTT_NEWS_TITLE.search(title_f)))
+        out[(p["uid"], p["start"] // 60)] = {
+            "live": live, "premiere": p["estreno"], "genre": p["genero"], "kids": p["infantil"]}
+    return out
+
+
+class OttGuide:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.index = {}
+        self.programs = 0
+        self.live = 0
+        self.updated = None
+
+    def update(self, index, n_programs):
+        with self.lock:
+            self.index = index
+            self.programs = n_programs
+            self.live = sum(1 for v in index.values() if v["live"])
+            self.updated = time.time()
+
+    def lookup(self, ch_id, ts):
+        with self.lock:
+            idx = self.index
+            for d in (0, -1, 1, -2, 2):
+                hit = idx.get((int(ch_id), ts // 60 + d))
+                if hit:
+                    return hit
+        return None
+
+
+class OttThread(threading.Thread):
+    def __init__(self, state):
+        super().__init__(daemon=True, name="ott")
+        self.state = state
+
+    def _cycle(self, progs, far_due):
+        today = date.today()
+        iso = lambda i: (today + timedelta(days=i)).isoformat()
+        per_day = defaultdict(int)
+        for p in progs.values():
+            per_day[time.strftime("%Y-%m-%d", time.localtime(p["start"]))] += 1
+        todo = [iso(i) for i in range(-OTT_PAST_DAYS, 0) if per_day[iso(i)] < 500]
+        todo += [iso(i) for i in range(OTT_NEAR_DAYS)]
+        far = [iso(i) for i in range(OTT_NEAR_DAYS, OTT_FUTURE_DAYS)] if far_due else []
+        fetched = 0
+        for day in todo + far:
+            got = ott_fetch_day(day)
+            if got is None:
+                continue
+            if not got and day in far:
+                break                       # past the end of the published guide
+            for p in got:
+                progs[(p["uid"], p["start"])] = p
+            fetched += 1
+            time.sleep(1)
+        cutoff = time.time() - OTT_KEEP_DAYS * 86400
+        for k in [k for k, p in progs.items() if p["start"] < cutoff]:
+            del progs[k]
+        return fetched
+
+    def run(self):
+        progs = ott_load_cache()
+        last_far = 0.0
+        time.sleep(30)                      # let channels and the IPTV EPG load first
+        while True:
+            wait = OTT_REFRESH
+            try:
+                far_due = time.time() - last_far > 23 * 3600
+                fetched = self._cycle(progs, far_due)
+                if fetched:
+                    if far_due:
+                        last_far = time.time()
+                    ott_save_cache(progs)
+                    index = ott_classify(list(progs.values()))
+                    self.state.ott.update(index, len(progs))
+                    self.state.rebuild_xmltv()
+                    print(f"[ott] {len(progs)} programs over {OTT_KEEP_DAYS} days, "
+                          f"{self.state.ott.live} live", flush=True)
+                else:
+                    wait = 600
+            except Exception as e:
+                print(f"[ott] Error: {e}", flush=True)
+                wait = 600
+            time.sleep(wait)
+
+
+def generate_xmltv(channels, epg, enrich=None):
     tz_offset = time.timezone // -3600
 
     lines = [
@@ -700,21 +929,39 @@ def generate_xmltv(channels, epg):
             sub_title = p.get("sub_title", "")
 
             display_title = serie if serie else title
+            info = enrich(ch_id, ts) if enrich else None
 
             lines.append(f'  <programme start="{start} {tz_s}" stop="{stop} {tz_e}" channel="{ch_id}.movistar.tv">')
             lines.append(f'    <title lang="es">{_xml_esc(display_title)}</title>')
+            if info and info["live"]:
+                lines.append('    <live/>')
             if sub_title:
                 lines.append(f'    <sub-title lang="es">{_xml_esc(sub_title)}</sub-title>')
             if desc:
                 lines.append(f'    <desc lang="es">{_xml_esc(desc)}</desc>')
             if genre_name:
                 lines.append(f'    <category lang="es">{_xml_esc(genre_name)}</category>')
+            cats_en = []
+            if info:
+                if info["genre"] and info["genre"] != genre_name:
+                    lines.append(f'    <category lang="es">{_xml_esc(info["genre"])}</category>')
+                cats_en += GENRE_EN.get(info["genre"], [])
+                if info["kids"]:
+                    cats_en.append("Children")
+            if not cats_en and GENRE_ES_TO_EN.get(genre_name):
+                cats_en.append(GENRE_ES_TO_EN[genre_name])
+            if season or episode:
+                cats_en.append("Series")
+            for c in dict.fromkeys(cats_en):
+                lines.append(f'    <category lang="en">{c}</category>')
             if year:
                 lines.append(f'    <date>{year}</date>')
             if season and episode:
                 lines.append(f'    <episode-num system="xmltv_ns">{season - 1}.{episode - 1}.</episode-num>')
             elif episode:
                 lines.append(f'    <episode-num system="xmltv_ns">.{episode - 1}.</episode-num>')
+            if info and info["premiere"]:
+                lines.append('    <premiere/>')
             lines.append(f'  </programme>')
 
     lines.append('</tv>')
@@ -938,6 +1185,7 @@ class RelayState:
         self.epg_time = None
         self.xmltv = ""
         self.xmltv_gz = b""
+        self.ott = OttGuide()
         self.logo_base = LOGO_BASES[0].rstrip("/") + "/" + LOGO_PATH
         self._logo_cache = {}
         self._logo_failed = {}
@@ -952,16 +1200,24 @@ class RelayState:
         with self.lock:
             return dict(self.channels)
 
+    def _store_xmltv(self, channels, epg):
+        xmltv = generate_xmltv(channels, epg, self.ott.lookup)
+        self.xmltv = xmltv
+        buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+            gz.write(xmltv.encode("utf-8"))
+        self.xmltv_gz = buf.getvalue()
+
+    def rebuild_xmltv(self):
+        with self.lock:
+            if self.epg and self.channels:
+                self._store_xmltv(self.channels, self.epg)
+
     def set_epg(self, epg, channels):
         with self.lock:
             self.epg = epg
             self.epg_time = time.time()
-            xmltv = generate_xmltv(channels, epg)
-            self.xmltv = xmltv
-            buf = io.BytesIO()
-            with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
-                gz.write(xmltv.encode("utf-8"))
-            self.xmltv_gz = buf.getvalue()
+            self._store_xmltv(channels, epg)
             try:
                 with open("/data/epg_cache.json", "w") as f:
                     json.dump({str(k): v for k, v in epg.items()}, f)
@@ -1031,7 +1287,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.21",
+                "version": "1.0.22",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
@@ -1043,6 +1299,10 @@ class RelayState:
                     "%Y-%m-%d %H:%M", time.localtime(self.epg_time)
                 ) if self.epg_time else None,
                 "active_streams": sum(len(v) for v in self.active.values()),
+                "ott_programs": self.ott.programs,
+                "ott_live": self.ott.live,
+                "ott_updated": time.strftime("%Y-%m-%d %H:%M", time.localtime(self.ott.updated))
+                if self.ott.updated else None,
                 "active_channels": list(self.active.keys()),
                 "total_served": self.total_served,
                 "bytes_relayed_mb": round(mb, 1),
@@ -1424,6 +1684,8 @@ def main():
     # Start background discovery
     discovery = DiscoveryThread(state, iface, interval=3600)
     discovery.start()
+    OttThread(state).start()
+    print("[relay] OTT guide enrichment started (live/premiere/genres)", flush=True)
     print("[relay] Channel discovery started in background", flush=True)
 
     RelayHandler.interface = iface

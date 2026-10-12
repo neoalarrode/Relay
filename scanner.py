@@ -52,7 +52,7 @@ try:
 except ImportError:
     HAS_SOCKS = False
 
-__version__ = "2.8.1"
+__version__ = "2.8.2"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -555,7 +555,45 @@ def download_epg_from_api(endpoint, channels, proxy=None):
 #  EPG: XMLTV Generation
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# In relay mode the guide is already complete (live/premiere flags, extra categories).
+# Re-serialising it here would drop everything the parser below does not read, so the
+# relay's XMLTV is served as-is and refreshed from the relay periodically.
+RELAY_GUIDE = {"url": None, "xml": None, "fetched": 0.0}
+RELAY_GUIDE_MAX_AGE = 30 * 60
+
+
+def _relay_guide_current():
+    g = RELAY_GUIDE
+    if not g["xml"]:
+        return None
+    if time.time() - g["fetched"] > RELAY_GUIDE_MAX_AGE:
+        try:
+            with urllib.request.urlopen(g["url"], timeout=30) as resp:
+                xml = resp.read().decode("utf-8")
+            if "<programme" not in xml or not xml.rstrip().endswith("</tv>"):
+                raise ValueError("incomplete guide")
+            g["xml"], g["fetched"] = xml, time.time()
+            log.info("Relay guide refreshed (%d KB)", len(xml) // 1024)
+        except Exception as e:
+            log.warning("Relay guide refresh failed, keeping previous: %s", e)
+            g["fetched"] = time.time() - RELAY_GUIDE_MAX_AGE + 300     # retry in 5 min
+    return g["xml"]
+
+
+def _write_guide(xml_str, output_path):
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(xml_str)
+    with gzip.open(output_path + ".gz", "wt", encoding="utf-8") as f:
+        f.write(xml_str)
+
+
 def generate_xmltv(channels, epg, output_path):
+    relay_xml = _relay_guide_current()
+    if relay_xml:
+        _write_guide(relay_xml, output_path)
+        log.info("XMLTV guide taken from relay: %s", output_path)
+        return
+
     tz_offset = time.timezone // -3600
 
     lines = [
@@ -620,12 +658,7 @@ def generate_xmltv(channels, epg, output_path):
 
     lines.append('</tv>')
 
-    xml_str = "\n".join(lines)
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(xml_str)
-
-    with gzip.open(output_path + ".gz", "wt", encoding="utf-8") as f:
-        f.write(xml_str)
+    _write_guide("\n".join(lines), output_path)
 
     log.info("XMLTV guide written: %s (%d channels)", output_path, len(epg))
 
@@ -1435,6 +1468,7 @@ def load_metadata_from_relay(udpxy_url):
         resp = urllib.request.urlopen(epg_url, timeout=30)
         xmltv = resp.read().decode("utf-8")
         root = fromstring(xmltv)
+        RELAY_GUIDE.update(url=epg_url, xml=xmltv, fetched=time.time())
         for prog in root.findall("programme"):
             ch_tag = prog.get("channel", "")
             ch_id = int(ch_tag.split(".")[0]) if "." in ch_tag else 0
