@@ -15,6 +15,7 @@ Endpoints:
 """
 
 import argparse
+import bisect
 import gzip
 import io
 import json
@@ -30,6 +31,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from html import unescape
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -227,8 +229,9 @@ def parse_dvb_chunk(data):
     }
 
 
-def download_dvb_xml(addr, port, iptv_ip, timeout=60):
+def download_dvb_xml(addr, port, iptv_ip, timeout=60, status=None):
     files = {}
+    complete = False
     sock, mreq = multicast_join(addr, port, iptv_ip, timeout=5)
     deadline = time.time() + timeout
     last_file = None
@@ -253,6 +256,7 @@ def download_dvb_xml(addr, port, iptv_ip, timeout=60):
                 key = f"{chunk['filetype']}_{chunk['fileid']}"
                 files[key] = xmldata[:-4]
                 if key == last_file:
+                    complete = True
                     break
             except (socket.timeout, struct.error):
                 continue
@@ -262,6 +266,8 @@ def download_dvb_xml(addr, port, iptv_ip, timeout=60):
         except OSError:
             pass
         sock.close()
+        if status is not None:
+            status["complete"] = complete
     return files
 
 
@@ -399,6 +405,13 @@ def parse_segments_xml(xml_str):
 _EPG_XOR = 0x15
 
 
+_CTRL = re.compile(r"[\x00-\x1f\x7f\ufffd]")
+
+
+def _clean_text(txt):
+    return _CTRL.sub("", txt).strip()
+
+
 def _xor_decode(raw):
     return bytes([b ^ _EPG_XOR for b in raw])
 
@@ -494,40 +507,33 @@ def parse_epg_binary_data(latin1_str, channels):
         description = ""
         f3 = data.find(0xF3, f1)
 
+        # F1 section: [len u16][6 bytes][year u16][ (tag, len, XOR text)* ].
+        # The long text is the full title with season/episode, not a synopsis.
         post = data[f1 + 1:f3] if f3 != -1 and f3 > f1 else b""
         if len(post) >= 10:
-            for yi in range(len(post) - 1):
-                yv = struct.unpack(">H", post[yi:yi + 2])[0]
+            sec_len = struct.unpack(">H", post[0:2])[0]
+            sect = post[2:2 + sec_len]
+            if sec_len == len(post) - 2 and len(sect) >= 8:
+                yv = struct.unpack(">H", sect[6:8])[0]
                 if 1920 <= yv <= 2999:
                     year = yv
-                    break
-
-            best_run = ""
-            run_start = -1
-            for di in range(len(post)):
-                db = post[di] ^ _EPG_XOR
-                if 0x20 <= db <= 0x7E or db >= 0x80:
-                    if run_start == -1:
-                        run_start = di
-                else:
-                    if run_start != -1 and di - run_start >= 5:
-                        candidate = _xor_decode(post[run_start:di])
-                        try:
-                            txt = candidate.decode("utf-8", errors="replace").strip()
-                        except Exception:
-                            txt = ""
-                        if len(txt) > len(best_run):
-                            best_run = txt
-                    run_start = -1
-            if run_start != -1 and len(post) - run_start >= 5:
-                candidate = _xor_decode(post[run_start:])
-                try:
-                    txt = candidate.decode("utf-8", errors="replace").strip()
-                except Exception:
-                    txt = ""
-                if len(txt) > len(best_run):
-                    best_run = txt
-            description = best_run
+                tail, i, texts = sect[8:], 0, []
+                while i + 2 <= len(tail):
+                    ln = tail[i + 1]
+                    val = tail[i + 2:i + 2 + ln]
+                    if len(val) < ln:
+                        break
+                    txt = _clean_text(_xor_decode(val).decode("utf-8", errors="ignore"))
+                    if txt:
+                        texts.append(txt)
+                    i += 2 + ln
+                description = max(texts, key=len) if texts else ""
+            else:
+                for yi in range(len(post) - 1):
+                    yv = struct.unpack(">H", post[yi:yi + 2])[0]
+                    if 1920 <= yv <= 2999:
+                        year = yv
+                        break
 
         sub_title = ""
         if serie and title != serie:
@@ -560,6 +566,10 @@ def parse_epg_binary_data(latin1_str, channels):
     return programs
 
 
+EPG_DAY_ATTEMPTS = 3
+EPG_KEEP_DAYS = 8
+
+
 def download_epg_binary(segments, iptv_ip, channels, timeout_per_day=45):
     epg = defaultdict(dict)
     total_programs = 0
@@ -571,7 +581,17 @@ def download_epg_binary(segments, iptv_ip, channels, timeout_per_day=45):
         day_num = int(day_match.group(1)) if day_match else -1
         print(f"[epg] Downloading EPG day {day_num} from {addr}:{port}...", flush=True)
 
-        dvb_files = download_dvb_xml(addr, port, iptv_ip, timeout=timeout_per_day)
+        dvb_files = {}
+        for attempt in range(EPG_DAY_ATTEMPTS):
+            st = {}
+            got = download_dvb_xml(addr, port, iptv_ip,
+                                   timeout=timeout_per_day + 30 * attempt, status=st)
+            for k, v in got.items():
+                dvb_files.setdefault(k, v)
+            if st.get("complete"):
+                break
+            print(f"[epg] Day {day_num}: carousel incomplete ({len(dvb_files)} files), "
+                  f"attempt {attempt + 1}/{EPG_DAY_ATTEMPTS}", flush=True)
         day_programs = 0
         for fname, data_str in dvb_files.items():
             try:
@@ -653,6 +673,163 @@ def _xml_esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
+# ── Guide completeness and per-programme metadata ──────────────────────────────
+
+# OTT genre -> IPTV genre code (index into GENRE_MAP), used for programmes that
+# exist only in the OTT guide.
+_OTT_CODE = {"Informativo": "2", "Magacín": "3", "Entretenimiento": "3", "Telerrealidad": "3",
+             "Humor": "3", "Dibujos animados": "5", "Preescolar": "5", "Música clásica": "6",
+             "Documental": "7", "Naturaleza": "7", "Historia": "7"}
+for _g in ("Fútbol", "Baloncesto", "Tenis", "Pádel", "Golf", "Ciclismo", "Motor", "Motociclismo",
+           "Fútbol americano", "Balonmano", "Hockey patines", "Hípica", "Rugby", "Boxeo",
+           "Programa deportes"):
+    _OTT_CODE[_g] = "4"
+
+# ageRatingID of Movistar's metadata, inferred from sample programmes (1 = unrated:
+# weather, news; 2 = kids/all audiences; 7 = adult content)
+AGE_LABELS = {2: "TP", 3: "+7", 4: "+12", 5: "+16", 7: "+18"}
+META_CACHE = "/data/meta_cache.json"
+META_WORKERS = 3
+META_CHUNK = 1500
+COVER_FROM, COVER_TO = "recortes.svc.imagenio.telefonica.net", "estatico.emisiondof6.com"
+
+
+def merge_epg(old, new, keep_days=EPG_KEEP_DAYS):
+    """Accumulate guides across downloads: a partial download must not erase days an
+    earlier one had. Fresh programmes replace older ones that overlap them."""
+    cutoff = time.time() - keep_days * 86400
+    out = {}
+    for ch in set(old) | set(new):
+        fresh = new.get(ch, {})
+        merged = {ts: p for ts, p in fresh.items() if ts >= cutoff}
+        iv = sorted((ts, ts + (p.get("duration") or 0)) for ts, p in fresh.items())
+        starts = [a for a, _ in iv]
+        for ts, p in old.get(ch, {}).items():
+            if ts in merged or ts < cutoff:
+                continue
+            if iv:
+                i = bisect.bisect_left(starts, ts + (p.get("duration") or 0))
+                if i and iv[i - 1][1] > ts:
+                    continue
+            merged[ts] = p
+        if merged:
+            out[ch] = merged
+    return out
+
+
+def fill_from_ott(epg, ott_progs, channels):
+    """Add OTT programmes where the IPTV guide has none (days the multicast download
+    missed). Same channel id; an existing overlapping programme always wins."""
+    if not ott_progs:
+        return epg
+    by_ch = defaultdict(list)
+    for p in ott_progs:
+        if p["uid"] in channels and p.get("dur", 0) > 0:
+            by_ch[p["uid"]].append(p)
+    out = dict(epg)
+    for uid, plist in by_ch.items():
+        cur = epg.get(uid, {})
+        starts = sorted(cur)
+        ends = [t + (cur[t].get("duration") or 0) for t in starts]
+        added = None
+        for p in sorted(plist, key=lambda x: x["start"]):
+            s0, e0 = p["start"], p["start"] + p["dur"]
+            i = bisect.bisect_left(starts, e0)
+            if i and ends[i - 1] > s0:
+                continue
+            if added is None:
+                added = dict(cur)
+            serie = p["titulo"] if (p["temp"] or p["epi"]) else ""
+            added[s0] = {"pid": 0, "duration": p["dur"], "full_title": p["titulo"], "serie": serie,
+                         "season": p["temp"], "episode": p["epi"], "year": 0, "desc": "",
+                         "genre": _OTT_CODE.get(p["genero"], "0"),
+                         "sub_title": p["ep"] if p["ep"] and p["ep"] != p["titulo"] else "",
+                         "ott": True}
+        if added is not None:
+            out[uid] = added
+    return out
+
+
+def fetch_program_meta(endpoint, show, uid):
+    """Synopsis, cover and age rating of one programme (Movistar epgInfov2)."""
+    try:
+        d = json.loads(unescape(http_get(
+            f"{endpoint}?action=epgInfov2&productID={show}&channelID={uid}", timeout=10))
+        ).get("resultData")
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    desc = d.get("description") or d.get("synopsis") or ""
+    desc = re.sub(r"\s+", " ", desc.replace("//", " ")).strip()[:900]
+    cover = ((d.get("covers") or {}).get("landscape") or "").replace(COVER_FROM, COVER_TO)
+    try:
+        age, rating = int(d.get("ageRatingID") or 0), int(d.get("rating") or 0)
+    except (TypeError, ValueError):
+        age = rating = 0
+    return {"d": desc, "c": cover, "a": age, "r": rating}
+
+
+class MetaThread(threading.Thread):
+    """Fills the metadata cache in the background: nearest programmes first, a few
+    requests at a time, persisted so a restart does not start over."""
+
+    def __init__(self, state):
+        super().__init__(daemon=True, name="meta")
+        self.state = state
+        self.failed = {}
+
+    def _load(self):
+        try:
+            with open(META_CACHE) as f:
+                return {int(k): v for k, v in json.load(f).items()}
+        except Exception:
+            return {}
+
+    def _save(self, meta, keep):
+        try:
+            with open(META_CACHE, "w") as f:
+                json.dump({str(k): v for k, v in meta.items() if k in keep}, f,
+                          ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            pass
+
+    def run(self):
+        self.state.meta = meta = self._load()
+        time.sleep(120)                     # after the OTT guide has been read
+        while True:
+            sleep_for = 900
+            try:
+                ep = self.state.endpoint
+                progs = [p for p in self.state.ott.progs if p["show"]]
+                keep = {p["show"] for p in progs}
+                now = time.time()
+                todo = [p for p in progs if p["show"] not in meta
+                        and now - self.failed.get(p["show"], 0) > 3 * 3600]
+                todo.sort(key=lambda p: (0, p["start"]) if p["start"] >= now - 3600 else (1, -p["start"]))
+                self.state.meta_pending = len(todo)
+                if ep and todo:
+                    chunk, got = todo[:META_CHUNK], 0
+                    with ThreadPoolExecutor(META_WORKERS) as ex:
+                        for p, res in zip(chunk, ex.map(
+                                lambda q: fetch_program_meta(ep, q["show"], q["uid"]), chunk)):
+                            if res is None:
+                                self.failed[p["show"]] = now
+                            else:
+                                meta[p["show"]] = res
+                                got += 1
+                    self.state.meta_pending = max(0, len(todo) - got)
+                    self._save(meta, keep)
+                    if got:
+                        self.state.rebuild_xmltv()
+                    print(f"[meta] {got}/{len(chunk)} fetched, {len(meta)} cached, "
+                          f"{self.state.meta_pending} pending", flush=True)
+                    sleep_for = 5 if len(todo) > len(chunk) else 900
+            except Exception as e:
+                print(f"[meta] Error: {e}", flush=True)
+            time.sleep(sleep_for)
+
+
 # ── OTT guide enrichment (live / premiere / finer genres) ───────────────────────
 # Movistar's IPTV EPG has no "live" flag, but the OTT guide (the one the Movistar+
 # app and web player use, public and unauthenticated) does: `Directo` per
@@ -666,7 +843,7 @@ OTT_FUTURE_DAYS = 12         # the guide runs ~10 days ahead; stop at the first 
 OTT_NEAR_DAYS = 3            # today + 2 are refreshed every cycle, farther days once a day
 OTT_KEEP_DAYS = 15
 OTT_REFRESH = 6 * 3600
-OTT_CACHE = "/data/ott_cache.json"
+OTT_CACHE = "/data/ott_cache2.json"
 OTT_LIVE_GENRES = ("Informativo", "Magacín")
 OTT_NEWS_24H = re.compile(
     r"24 ?horas|euronews|cnn|bbc news|al jazeera|france ?24|cgtn|\bdw\b|cnbc|sky news|"
@@ -711,6 +888,11 @@ def _ott_flat(o):
                 yield from _ott_flat(v)
 
 
+def _first_int(v):
+    m = re.search(r"\d+", str(v or ""))
+    return int(m.group()) if m else 0
+
+
 def ott_fetch_day(day):
     """One full day (the `from` pivot) -> list of compact programmes, or None on error."""
     try:
@@ -735,11 +917,15 @@ def ott_fetch_day(day):
             "genero": p.get("GeneroComAntena") or "",
             "directo": bool(p.get("Directo")), "estreno": bool(p.get("Estreno")),
             "infantil": bool(p.get("Infantil")),
+            "show": int(p.get("ShowId") or 0), "ep": p.get("TituloEpisodio") or "",
+            "temp": _first_int(p.get("Temporada")), "epi": _first_int(p.get("Episodio")),
+            "dur": int(p.get("DuracionParrillaEnSegundos") or 0),
         })
     return out
 
 
-_OTT_FIELDS = ("uid", "start", "canal", "titulo", "genero", "directo", "estreno", "infantil")
+_OTT_FIELDS = ("uid", "start", "canal", "titulo", "genero", "directo", "estreno", "infantil",
+               "show", "ep", "temp", "epi", "dur")
 
 
 def ott_load_cache():
@@ -797,7 +983,8 @@ def ott_classify(progs):
                         or weekly[(p["canal"], p["titulo"])] >= 4
                         or bool(OTT_NEWS_TITLE.search(title_f)))
         out[(p["uid"], p["start"] // 60)] = {
-            "live": live, "premiere": p["estreno"], "genre": p["genero"], "kids": p["infantil"]}
+            "live": live, "premiere": p["estreno"], "genre": p["genero"], "kids": p["infantil"],
+            "show": p["show"]}
     return out
 
 
@@ -805,14 +992,16 @@ class OttGuide:
     def __init__(self):
         self.lock = threading.Lock()
         self.index = {}
+        self.progs = []
         self.programs = 0
         self.live = 0
         self.updated = None
 
-    def update(self, index, n_programs):
+    def update(self, index, progs):
         with self.lock:
             self.index = index
-            self.programs = n_programs
+            self.progs = progs
+            self.programs = len(progs)
             self.live = sum(1 for v in index.values() if v["live"])
             self.updated = time.time()
 
@@ -870,7 +1059,7 @@ class OttThread(threading.Thread):
                         last_far = time.time()
                     ott_save_cache(progs)
                     index = ott_classify(list(progs.values()))
-                    self.state.ott.update(index, len(progs))
+                    self.state.ott.update(index, list(progs.values()))
                     try:
                         self.state.rebuild_xmltv()
                     except Exception as e:
@@ -928,11 +1117,14 @@ def generate_xmltv(channels, epg, enrich=None):
             if genre:
                 genre_name = GENRE_MAP.get(str(genre)[:1], "")
             year = p.get("year", 0)
-            desc = p.get("desc", "")
+            desc = ""
             sub_title = p.get("sub_title", "")
 
             display_title = serie if serie else title
             info = enrich(ch_id, ts) if enrich else None
+            meta = (info or {}).get("meta") or {}
+            if meta.get("d"):
+                desc = meta["d"]
 
             lines.append(f'  <programme start="{start} {tz_s}" stop="{stop} {tz_e}" channel="{ch_id}.movistar.tv">')
             lines.append(f'    <title lang="es">{_xml_esc(display_title)}</title>')
@@ -959,12 +1151,18 @@ def generate_xmltv(channels, epg, enrich=None):
                 lines.append(f'    <category lang="en">{c}</category>')
             if year:
                 lines.append(f'    <date>{year}</date>')
+            if meta.get("c"):
+                lines.append(f'    <icon src="{_xml_esc(meta["c"])}"/>')
             if season and episode:
                 lines.append(f'    <episode-num system="xmltv_ns">{season - 1}.{episode - 1}.</episode-num>')
             elif episode:
                 lines.append(f'    <episode-num system="xmltv_ns">.{episode - 1}.</episode-num>')
             if info and info["premiere"]:
                 lines.append('    <premiere/>')
+            if AGE_LABELS.get(meta.get("a")):
+                lines.append(f'    <rating system="ES"><value>{AGE_LABELS[meta["a"]]}</value></rating>')
+            if meta.get("r"):
+                lines.append(f'    <star-rating><value>{meta["r"] / 10:g}/10</value></star-rating>')
             lines.append(f'  </programme>')
 
     lines.append('</tv>')
@@ -1189,6 +1387,9 @@ class RelayState:
         self.xmltv = ""
         self.xmltv_gz = b""
         self.ott = OttGuide()
+        self.meta = {}
+        self.meta_pending = 0
+        self.endpoint = None
         self.logo_base = LOGO_BASES[0].rstrip("/") + "/" + LOGO_PATH
         self._logo_cache = {}
         self._logo_failed = {}
@@ -1203,8 +1404,18 @@ class RelayState:
         with self.lock:
             return dict(self.channels)
 
+    def _enrich(self, ch_id, ts):
+        info = self.ott.lookup(ch_id, ts)
+        if info and info.get("show") in self.meta:
+            info = dict(info, meta=self.meta[info["show"]])
+        return info
+
+    def epg_snapshot(self):
+        with self.lock:
+            return {ch: dict(p) for ch, p in self.epg.items()}
+
     def _store_xmltv(self, channels, epg):
-        xmltv = generate_xmltv(channels, epg, self.ott.lookup)
+        xmltv = generate_xmltv(channels, fill_from_ott(epg, self.ott.progs, channels), self._enrich)
         self.xmltv = xmltv
         buf = io.BytesIO()
         with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
@@ -1290,7 +1501,7 @@ class RelayState:
             m, s = divmod(m, 60)
             mb = self.bytes_relayed / (1024 * 1024)
             return {
-                "version": "1.0.23",
+                "version": "1.0.24",
                 "uptime": f"{h}h {m}m {s}s",
                 "channels_discovered": len(self.channels),
                 "channels_updated": time.strftime(
@@ -1303,6 +1514,8 @@ class RelayState:
                 ) if self.epg_time else None,
                 "active_streams": sum(len(v) for v in self.active.values()),
                 "ott_programs": self.ott.programs,
+                "meta_cached": len(self.meta),
+                "meta_pending": self.meta_pending,
                 "ott_live": self.ott.live,
                 "ott_updated": time.strftime("%Y-%m-%d %H:%M", time.localtime(self.ott.updated))
                 if self.ott.updated else None,
@@ -1546,6 +1759,8 @@ class DiscoveryThread(threading.Thread):
                 channels, segments, endpoint, logo_base = discover_channels(self.iptv_ip)
                 if logo_base:
                     self.state.logo_base = logo_base
+                if endpoint:
+                    self.state.endpoint = endpoint
                 if not channels:
                     print("[discovery] No channels found", flush=True)
                     time.sleep(self.interval)
@@ -1599,7 +1814,11 @@ class EPGThread(threading.Thread):
                         epg[ch_id].update(progs)
 
             if epg:
-                self.state.set_epg(epg, self.channels)
+                merged = merge_epg(self.state.epg_snapshot(), epg)
+                print(f"[epg] Merged with previous guide: "
+                      f"{sum(len(p) for p in epg.values())} downloaded, "
+                      f"{sum(len(p) for p in merged.values())} kept", flush=True)
+                self.state.set_epg(merged, self.channels)
             else:
                 print("[epg] No EPG data obtained", flush=True)
 
@@ -1689,6 +1908,7 @@ def main():
     discovery = DiscoveryThread(state, iface, interval=3600)
     discovery.start()
     OttThread(state).start()
+    MetaThread(state).start()
     print("[relay] OTT guide enrichment started (live/premiere/genres)", flush=True)
     print("[relay] Channel discovery started in background", flush=True)
 
